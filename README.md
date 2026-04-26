@@ -117,7 +117,7 @@ nano .env
 
 Важно:
 
-- `APP_BASE_URL` должен быть публичным адресом сервера, например `http://87.120.165.153:8010`
+- `APP_BASE_URL` должен быть публичным HTTPS-доменом, например `https://tasktrackvoice.duckdns.org`
 - `GOOGLE_REDIRECT_URI` должен совпадать с OAuth-настройкой в Google Cloud
 - `POSTGRES_PASSWORD` и `APP_SECRET_KEY` задай своими
 
@@ -138,7 +138,7 @@ docker compose logs -f app
 
 Открой:
 
-`http://YOUR_SERVER_IP:8010/health`
+`https://YOUR_DOMAIN/health`
 
 Должен прийти JSON с `status: ok`
 
@@ -171,4 +171,3 @@ http://YOUR_SERVER_IP:8010/auth/google/callback
 - Парсинг дат зависит от качества текста и модели
 - Для надёжного production лучше потом добавить Redis/очередь и webhook вместо polling
 - Пока создаётся именно календарное событие, не отдельная Google Task
-
