@@ -53,3 +53,15 @@ class GoogleAccount(Base):
 
     user: Mapped[User] = relationship(back_populates="google_account")
 
+
+class ConversationState(Base):
+    __tablename__ = "conversation_states"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    memory_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    pending_confirmation_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pending_suggestions_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
