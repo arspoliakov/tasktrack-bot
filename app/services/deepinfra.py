@@ -16,8 +16,12 @@ class DeepInfraClient:
     async def transcribe(self, filename: str, content: bytes) -> str:
         url = f"https://api.deepinfra.com/v1/inference/{self.settings.deepinfra_stt_model}"
         files = {"audio": (filename, content, "audio/ogg")}
+        data = {
+            "language": "ru",
+            "task": "transcribe",
+        }
         async with httpx.AsyncClient(timeout=120) as client:
-            response = await client.post(url, headers=self.headers, files=files)
+            response = await client.post(url, headers=self.headers, files=files, data=data)
             response.raise_for_status()
             data = response.json()
 
@@ -54,3 +58,19 @@ class DeepInfraClient:
         if isinstance(content, str):
             return json.loads(content)
         return content
+
+    async def chat_text(self, messages: list[dict[str, str]], temperature: float = 0.3) -> str:
+        url = "https://api.deepinfra.com/v1/openai/chat/completions"
+        payload = {
+            "model": self.settings.deepinfra_parser_model,
+            "messages": messages,
+            "temperature": temperature,
+        }
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            response = await client.post(url, headers=self.headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+        content = data["choices"][0]["message"]["content"]
+        return content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
