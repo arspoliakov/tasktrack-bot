@@ -118,13 +118,13 @@ class TelegramBotService:
             ]
         )
 
-    def _suggestion_keyboard(self, count: int) -> InlineKeyboardMarkup:
+    def _suggestion_keyboard(self, options: list[dict]) -> InlineKeyboardMarkup:
         rows = []
-        for index in range(min(count, 3)):
+        for index, option in enumerate(options[:3]):
             rows.append(
                 [
                     InlineKeyboardButton(
-                        text=f"Вариант {index + 1}",
+                        text=option["label"],
                         callback_data=ActionCallback(action="pick_suggestion", option=index).pack(),
                     )
                 ]
@@ -322,6 +322,55 @@ class TelegramBotService:
             return True
 
         return False
+
+    async def _handle_pending_confirmation_update(
+        self,
+        *,
+        message: Message,
+    ) -> bool:
+        pending = self.pending_confirmations.get(message.from_user.id)
+        if not pending:
+            return False
+
+        text = (message.text or "").strip()
+        if not text or self._is_yes(text) or self._is_no(text):
+            return False
+
+        revised = await self.parser.revise_event_draft(
+            draft_title=pending["title"],
+            draft_description=pending["description"],
+            draft_start_iso=pending["start_iso"],
+            draft_end_iso=pending["end_iso"],
+            user_message=text,
+        )
+        if revised.get("needs_clarification"):
+            reply = revised.get("clarification_question") or "Не до конца понял, как поправить черновик."
+            await message.answer(reply)
+            self._remember(message.from_user.id, "assistant", reply)
+            return True
+
+        timezone = revised.get("timezone") or pending["timezone"]
+        start_at = self._ensure_tz(datetime.fromisoformat(revised["start_iso"]))
+        end_at = self._ensure_tz(datetime.fromisoformat(revised["end_iso"]))
+        title = revised.get("title") or pending["title"]
+        description = revised.get("description") or pending["description"]
+
+        self.pending_confirmations[message.from_user.id] = {
+            "title": title,
+            "description": description,
+            "start_iso": start_at.isoformat(),
+            "end_iso": end_at.isoformat(),
+            "timezone": timezone,
+        }
+        reply = (
+            "Обновил черновик:\n"
+            f"• {escape(title)}\n"
+            f"• {self._format_dt(start_at)} — {self._format_dt(end_at)}\n\n"
+            "Если всё так, жми кнопку ниже."
+        )
+        await message.answer(reply, reply_markup=self._confirm_keyboard())
+        self._remember(message.from_user.id, "assistant", f"Обновил черновик {title} на {self._format_dt(start_at)}.")
+        return True
 
     async def _contextual_reply(self, message: Message, text: str) -> bool:
         if not self._is_reaction(text):
@@ -585,6 +634,9 @@ class TelegramBotService:
         ):
             return
 
+        if await self._handle_pending_confirmation_update(message=message):
+            return
+
         text = message.text or ""
         self._remember(message.from_user.id, "user", text)
         await self._route_intent(
@@ -749,7 +801,7 @@ class TelegramBotService:
                     f"Зато могу поставить на {options[0]['label']}.{tail}\n"
                     "Выбирай вариант кнопкой ниже."
                 )
-                await message.answer(reply, reply_markup=self._suggestion_keyboard(len(options)))
+                await message.answer(reply, reply_markup=self._suggestion_keyboard(options))
                 self._remember(message.from_user.id, "assistant", reply)
                 return
             reply = "В это время уже есть событие, и рядом я не нашёл нормального свободного окна. Подскажи другое время."

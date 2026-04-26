@@ -91,3 +91,43 @@ class TaskParser:
             {"role": "user", "content": text},
         ]
         return await self.client.chat_json(messages)
+
+    async def revise_event_draft(
+        self,
+        *,
+        draft_title: str,
+        draft_description: str,
+        draft_start_iso: str,
+        draft_end_iso: str,
+        user_message: str,
+    ) -> dict[str, Any]:
+        now = datetime.now(self.timezone)
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You revise an existing calendar event draft based on a follow-up user message. "
+                    "Return only JSON with keys: title, description, start_iso, end_iso, timezone, "
+                    "needs_clarification, clarification_question. "
+                    f"Assume timezone {self.settings.default_timezone}. "
+                    f"Current datetime is {now.isoformat()}. "
+                    "Always keep explicit timezone offsets in start_iso and end_iso. "
+                    "If the user says things like 'not at 15, at 16', 'make it 30 minutes', "
+                    "'rename it', or 'move to tomorrow', update only the relevant parts of the draft. "
+                    "If the user message is too vague to update the draft safely, set needs_clarification=true. "
+                    "clarification_question must be short, friendly, in Russian, and address the user as 'ты'."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Current draft:\n"
+                    f"title={draft_title}\n"
+                    f"description={draft_description}\n"
+                    f"start_iso={draft_start_iso}\n"
+                    f"end_iso={draft_end_iso}\n\n"
+                    f"User update:\n{user_message}"
+                ),
+            },
+        ]
+        return await self.client.chat_json(messages)

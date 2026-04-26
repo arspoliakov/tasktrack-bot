@@ -191,9 +191,11 @@ class GoogleCalendarService:
         count: int = 3,
     ) -> list[tuple[datetime, datetime]]:
         tz = ZoneInfo(timezone)
+        desired_start = desired_start.astimezone(tz)
+        desired_end = desired_end.astimezone(tz)
         duration = desired_end - desired_start
-        search_start = (desired_start - timedelta(hours=3)).astimezone(tz)
-        search_end = (desired_end + timedelta(hours=8)).astimezone(tz)
+        search_start = max(datetime.now(tz), desired_start - timedelta(hours=2))
+        search_end = desired_end + timedelta(hours=8)
         events = await self.list_events(
             access_token=access_token,
             refresh_token=refresh_token,
@@ -212,15 +214,34 @@ class GoogleCalendarService:
 
         busy_ranges.sort(key=lambda item: item[0])
         suggestions: list[tuple[datetime, datetime]] = []
-        candidate = search_start
+        seen: set[str] = set()
 
-        while candidate + duration <= search_end and len(suggestions) < count:
-            overlap = next((item for item in busy_ranges if item[0] < candidate + duration and item[1] > candidate), None)
-            if overlap:
-                candidate = overlap[1]
+        def is_free(candidate_start: datetime) -> bool:
+            candidate_end = candidate_start + duration
+            return all(not (busy_start < candidate_end and busy_end > candidate_start) for busy_start, busy_end in busy_ranges)
+
+        candidates: list[datetime] = [desired_start]
+
+        # Prefer the nearest free slots around the originally requested time.
+        for step in range(1, 17):
+            delta = timedelta(minutes=15 * step)
+            before = desired_start - delta
+            after = desired_start + delta
+            if before >= search_start:
+                candidates.append(before)
+            if after + duration <= search_end:
+                candidates.append(after)
+
+        for candidate in candidates:
+            normalized = candidate.astimezone(tz).replace(second=0, microsecond=0)
+            key = normalized.isoformat()
+            if key in seen:
                 continue
-            suggestions.append((candidate, candidate + duration))
-            candidate += timedelta(hours=1)
+            seen.add(key)
+            if is_free(normalized):
+                suggestions.append((normalized, normalized + duration))
+            if len(suggestions) >= count:
+                break
 
         return suggestions
 
