@@ -14,6 +14,31 @@ class TaskParser:
         self.settings = get_settings()
         self.timezone = ZoneInfo(self.settings.default_timezone)
 
+    async def classify_intent(self, text: str) -> dict[str, Any]:
+        now = datetime.now(self.timezone)
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You route Telegram calendar assistant messages. "
+                    "Return only JSON with keys: intent, confidence, reply_style, clarification_question. "
+                    "Allowed intents: create_event, today_schedule, next_event, general_help, clarify, other. "
+                    "reply_style must be one of: casual, neutral. "
+                    "Use create_event when the user wants to add, move, reschedule, or plan a calendar event. "
+                    "Use today_schedule when the user asks what is planned today. "
+                    "Use next_event when the user asks what is next, what is happening now, or what comes after. "
+                    "Use general_help when the user asks what the bot can do. "
+                    "Use clarify when the intent is probably calendar-related but ambiguous. "
+                    "Use other for unrelated conversation. "
+                    "clarification_question must be empty unless intent=clarify. "
+                    "If intent=clarify, clarification_question must be friendly, short, and in Russian, addressing the user as 'ты'. "
+                    f"Current datetime is {now.isoformat()} in timezone {self.settings.default_timezone}."
+                ),
+            },
+            {"role": "user", "content": text},
+        ]
+        return await self.client.chat_json(messages)
+
     async def parse_event(self, text: str) -> dict[str, Any]:
         now = datetime.now(self.timezone)
         tomorrow = (now + timedelta(days=1)).date().isoformat()

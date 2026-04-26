@@ -60,36 +60,6 @@ class TelegramBotService:
     def _ensure_tz(self, value: datetime) -> datetime:
         return value if value.tzinfo else value.replace(tzinfo=self._tz())
 
-    def _is_today_question(self, text: str) -> bool:
-        lowered = text.lower()
-        triggers = (
-            "что у меня сегодня",
-            "какие у меня сегодня задачи",
-            "что сегодня",
-            "мои задачи на сегодня",
-            "what do i have today",
-            "what are my goals today",
-            "what are my tasks today",
-            "what's on my calendar today",
-        )
-        return any(trigger in lowered for trigger in triggers)
-
-    def _is_next_question(self, text: str) -> bool:
-        lowered = text.lower()
-        triggers = (
-            "что сейчас",
-            "что у меня сейчас",
-            "что дальше",
-            "что у меня дальше",
-            "следующая встреча",
-            "что потом",
-            "what's next",
-            "what do i have next",
-            "what is next",
-            "what do i have now",
-        )
-        return any(trigger in lowered for trigger in triggers)
-
     @staticmethod
     def _is_yes(text: str) -> bool:
         return text.strip().lower() in {"да", "ага", "ок", "окей", "давай", "yes", "создавай"}
@@ -257,7 +227,7 @@ class TelegramBotService:
 
         return False
 
-    async def _handle_intent(
+    async def _route_intent(
         self,
         *,
         message: Message,
@@ -265,7 +235,10 @@ class TelegramBotService:
         access_token: str | None,
         refresh_token: str,
     ) -> None:
-        if self._is_today_question(text):
+        routing = await self.parser.classify_intent(text)
+        intent = routing.get("intent", "other")
+
+        if intent == "today_schedule":
             await self._answer_today_schedule(
                 message=message,
                 access_token=access_token,
@@ -273,7 +246,7 @@ class TelegramBotService:
             )
             return
 
-        if self._is_next_question(text):
+        if intent == "next_event":
             await self._answer_next_event(
                 message=message,
                 access_token=access_token,
@@ -281,12 +254,30 @@ class TelegramBotService:
             )
             return
 
-        await self._process_event_request(
-            message=message,
-            text=text,
-            refresh_token=refresh_token,
-            access_token=access_token,
-        )
+        if intent == "general_help":
+            await message.answer(
+                "Я могу создать событие, подсказать планы на сегодня и сказать, что у тебя дальше по календарю.\n"
+                "Например:\n"
+                "• «созвон завтра в 15:00 на час»\n"
+                "• «что у меня сегодня»\n"
+                "• «что дальше»"
+            )
+            return
+
+        if intent == "clarify":
+            await message.answer(routing.get("clarification_question") or "Не до конца понял. Ты хочешь создать событие или посмотреть расписание?")
+            return
+
+        if intent == "create_event":
+            await self._process_event_request(
+                message=message,
+                text=text,
+                refresh_token=refresh_token,
+                access_token=access_token,
+            )
+            return
+
+        await self._friendly_fallback(message, text)
 
     async def _friendly_fallback(self, message: Message, text: str) -> None:
         prompt = [
@@ -295,8 +286,9 @@ class TelegramBotService:
                 "content": (
                     "Ты дружелюбный русскоязычный ассистент по календарю в Telegram. "
                     "Отвечай коротко, тепло, на ты, без канцелярита. "
-                    "Если запрос не про создание события, скажи, чем ты полезен: "
-                    "можешь создать событие, подсказать планы на сегодня, сказать что дальше по календарю. "
+                    "Не выдумывай факты и не говори, что у тебя нет доступа к календарю, если тебя об этом прямо не спросили. "
+                    "Скажи, что ты можешь: создать событие, подсказать планы на сегодня, сказать что дальше по календарю. "
+                    "Предложи пользователю сформулировать запрос проще, с примерами. "
                     "Если пользователь жалуется на распознавание, извинись и коротко скажи, что теперь слушаешь по-русски. "
                     "Отвечай только по-русски."
                 ),
@@ -443,10 +435,9 @@ class TelegramBotService:
         ):
             return
 
-        text = message.text or ""
-        await self._handle_intent(
+        await self._route_intent(
             message=message,
-            text=text,
+            text=message.text or "",
             access_token=google_account.access_token,
             refresh_token=google_account.refresh_token,
         )
@@ -463,7 +454,7 @@ class TelegramBotService:
         file_bytes = await self.bot.download_file(file.file_path)
         transcript = await self.deepinfra.transcribe("voice.ogg", file_bytes.read())
         await message.answer(f"Вот что я услышал:\n<blockquote>{escape(transcript)}</blockquote>")
-        await self._handle_intent(
+        await self._route_intent(
             message=message,
             text=transcript,
             access_token=google_account.access_token,
