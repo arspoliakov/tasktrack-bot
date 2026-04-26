@@ -98,6 +98,21 @@ class GoogleCalendarService:
 
         return await asyncio.to_thread(_insert)
 
+    async def delete_event(
+        self,
+        *,
+        access_token: str | None,
+        refresh_token: str,
+        event_id: str,
+    ) -> None:
+        credentials = self._build_credentials(access_token, refresh_token)
+
+        def _delete() -> None:
+            service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
+            service.events().delete(calendarId="primary", eventId=event_id).execute()
+
+        await asyncio.to_thread(_delete)
+
     async def list_events(
         self,
         *,

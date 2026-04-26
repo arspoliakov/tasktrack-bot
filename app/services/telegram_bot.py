@@ -77,16 +77,36 @@ class TelegramBotService:
     def _is_no(text: str) -> bool:
         return text.strip().lower() in {"нет", "неа", "отмена", "cancel", "no"}
 
+    @staticmethod
+    def _is_reaction(text: str) -> bool:
+        cleaned = text.strip().lower()
+        if len(cleaned) <= 18:
+            return True
+        reactions = (
+            "и все",
+            "серьезно",
+            "офигеть",
+            "капец",
+            "жесть",
+            "да понял",
+            "понял уже",
+            "лол",
+            "мда",
+            "ну ок",
+            "ясно",
+        )
+        return any(item in cleaned for item in reactions)
+
     def _remember(self, user_id: int, role: str, content: str) -> None:
         history = self.conversation_memory.setdefault(user_id, [])
         history.append({"role": role, "content": content})
-        self.conversation_memory[user_id] = history[-10:]
+        self.conversation_memory[user_id] = history[-12:]
 
     def _memory_prompt(self, user_id: int) -> str:
         history = self.conversation_memory.get(user_id, [])
         if not history:
             return ""
-        return "\n".join(f"{item['role']}: {item['content']}" for item in history[-8:])
+        return "\n".join(f"{item['role']}: {item['content']}" for item in history[-10:])
 
     def _confirm_keyboard(self) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
@@ -104,7 +124,7 @@ class TelegramBotService:
             rows.append(
                 [
                     InlineKeyboardButton(
-                        text=f"Выбрать вариант {index + 1}",
+                        text=f"Вариант {index + 1}",
                         callback_data=ActionCallback(action="pick_suggestion", option=index).pack(),
                     )
                 ]
@@ -303,6 +323,33 @@ class TelegramBotService:
 
         return False
 
+    async def _contextual_reply(self, message: Message, text: str) -> bool:
+        if not self._is_reaction(text):
+            return False
+
+        memory = self._memory_prompt(message.from_user.id)
+        if not memory:
+            return False
+
+        prompt = [
+            {
+                "role": "system",
+                "content": (
+                    "Ты дружелюбный русскоязычный календарный ассистент в Telegram. "
+                    "Пользователь только что отреагировал на предыдущий ответ короткой репликой. "
+                    "Ответь коротко, по-человечески, на ты, продолжая текущий контекст. "
+                    "Не начинай заново перечислять расписание, если тебя об этом не попросили явно. "
+                    "Не извиняйся без причины. Не выдумывай факты. Если пользователь удивлён малому количеству дел, "
+                    "можно спокойно подтвердить это и предложить что-то запланировать."
+                ),
+            },
+            {"role": "user", "content": f"Recent conversation:\n{memory}\n\nLast user reaction:\n{text}"},
+        ]
+        reply = await self.deepinfra.chat_text(prompt, temperature=0.5)
+        await message.answer(reply)
+        self._remember(message.from_user.id, "assistant", reply)
+        return True
+
     async def _route_intent(
         self,
         *,
@@ -311,6 +358,9 @@ class TelegramBotService:
         access_token: str | None,
         refresh_token: str,
     ) -> None:
+        if await self._contextual_reply(message, text):
+            return
+
         routing_input = text
         memory = self._memory_prompt(message.from_user.id)
         if memory:
@@ -355,6 +405,15 @@ class TelegramBotService:
 
         if intent == "create_event":
             await self._process_event_request(
+                message=message,
+                text=text,
+                refresh_token=refresh_token,
+                access_token=access_token,
+            )
+            return
+
+        if intent == "cancel_event":
+            await self._process_cancel_request(
                 message=message,
                 text=text,
                 refresh_token=refresh_token,
@@ -684,7 +743,7 @@ class TelegramBotService:
                     "options": options,
                 }
                 time_text = conflict_start.strftime("%H:%M") if conflict_start else "это время"
-                tail = f" Если удобнее, еще есть {options[1]['label']}." if len(options) > 1 else ""
+                tail = f" Если удобнее, ещё есть {options[1]['label']}." if len(options) > 1 else ""
                 reply = (
                     f"Смотри, в {time_text} у тебя уже стоит «{conflict_title}».\n"
                     f"Зато могу поставить на {options[0]['label']}.{tail}\n"
@@ -715,3 +774,68 @@ class TelegramBotService:
         )
         await message.answer(reply, reply_markup=self._confirm_keyboard())
         self._remember(message.from_user.id, "assistant", f"Предложил создать {title} на {self._format_dt(start_at)}.")
+
+    async def _process_cancel_request(
+        self,
+        *,
+        message: Message,
+        text: str,
+        refresh_token: str,
+        access_token: str | None,
+    ) -> None:
+        parsed = await self.parser.parse_cancel_request(text)
+        if parsed.get("needs_clarification"):
+            reply = parsed.get("clarification_question") or "Уточни, какое именно событие убрать."
+            await message.answer(reply)
+            self._remember(message.from_user.id, "assistant", reply)
+            return
+        if not parsed.get("should_cancel"):
+            await self._friendly_fallback(message, text)
+            return
+
+        timezone = parsed.get("timezone") or self.settings.default_timezone
+        time_min = self._ensure_tz(datetime.fromisoformat(parsed["date_from_iso"]))
+        time_max = self._ensure_tz(datetime.fromisoformat(parsed["date_to_iso"]))
+        title_query = (parsed.get("title_query") or "").strip().lower()
+
+        events = await self.calendar_service.list_events(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            time_min=time_min,
+            time_max=time_max,
+            timezone=timezone,
+            limit=30,
+        )
+
+        matches = []
+        for event in events:
+            summary = (event.get("summary") or "").lower()
+            if not title_query or title_query in summary:
+                matches.append(event)
+
+        if not matches:
+            reply = "Не нашёл подходящее событие в календаре. Попробуй точнее назвать его или дату."
+            await message.answer(reply)
+            self._remember(message.from_user.id, "assistant", reply)
+            return
+
+        if len(matches) > 1:
+            options = []
+            for event in matches[:3]:
+                start = self.calendar_service.parse_event_datetime(event, timezone, "start")
+                options.append(f"{start.strftime('%d.%m %H:%M') if start else 'весь день'} — {escape(event.get('summary') or 'Без названия')}")
+            reply = "Нашёл несколько похожих событий:\n" + "\n".join(f"• {item}" for item in options) + "\n\nНапиши точнее, какое удалить."
+            await message.answer(reply)
+            self._remember(message.from_user.id, "assistant", reply)
+            return
+
+        target = matches[0]
+        await self.calendar_service.delete_event(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            event_id=target["id"],
+        )
+        title = escape(target.get("summary") or "событие")
+        reply = f"Готово, удалил «{title}» из календаря."
+        await message.answer(reply)
+        self._remember(message.from_user.id, "assistant", reply)

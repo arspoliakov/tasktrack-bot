@@ -22,9 +22,10 @@ class TaskParser:
                 "content": (
                     "You route Telegram calendar assistant messages. "
                     "Return only JSON with keys: intent, confidence, reply_style, clarification_question. "
-                    "Allowed intents: create_event, today_schedule, next_event, general_help, clarify, other. "
+                    "Allowed intents: create_event, cancel_event, today_schedule, next_event, general_help, clarify, other. "
                     "reply_style must be one of: casual, neutral. "
                     "Use create_event when the user wants to add, move, reschedule, or plan a calendar event. "
+                    "Use cancel_event when the user wants to cancel, delete, remove, or drop an event from the calendar. "
                     "Use today_schedule when the user asks what is planned today. "
                     "Use next_event when the user asks what is next, what is happening now, or what comes after. "
                     "Use general_help when the user asks what the bot can do. "
@@ -33,6 +34,30 @@ class TaskParser:
                     "clarification_question must be empty unless intent=clarify. "
                     "If intent=clarify, clarification_question must be friendly, short, and in Russian, addressing the user as 'ты'. "
                     f"Current datetime is {now.isoformat()} in timezone {self.settings.default_timezone}."
+                ),
+            },
+            {"role": "user", "content": text},
+        ]
+        return await self.client.chat_json(messages)
+
+    async def parse_cancel_request(self, text: str) -> dict[str, Any]:
+        now = datetime.now(self.timezone)
+        tomorrow = (now + timedelta(days=1)).date().isoformat()
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You extract calendar cancellation requests from Russian or English messages. "
+                    "Return only JSON with keys: should_cancel(boolean), title_query(string), "
+                    "date_from_iso(string), date_to_iso(string), timezone(string), "
+                    "needs_clarification(boolean), clarification_question(string). "
+                    f"Assume timezone {self.settings.default_timezone}. "
+                    f"Current datetime is {now.isoformat()}. Tomorrow date is {tomorrow}. "
+                    "If the user says today, use today's date boundaries in that timezone. "
+                    "If the user says tomorrow, use tomorrow's date boundaries in that timezone. "
+                    "If no date is provided, default to a search window from now to 7 days ahead. "
+                    "If no identifiable event title or time clue is present, set needs_clarification=true. "
+                    "clarification_question must be friendly, short, and in Russian, speaking to the user with 'ты'."
                 ),
             },
             {"role": "user", "content": text},
