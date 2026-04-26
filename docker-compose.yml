@@ -9,6 +9,8 @@ services:
       - .env
     depends_on:
       - postgres
+    ports:
+      - "127.0.0.1:8010:8000"
 
   postgres:
     image: postgres:16-alpine
@@ -21,21 +23,5 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
-  caddy:
-    image: caddy:2-alpine
-    container_name: tasktrack-bot-caddy
-    restart: unless-stopped
-    depends_on:
-      - app
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-
 volumes:
   postgres_data:
-  caddy_data:
-  caddy_config:
