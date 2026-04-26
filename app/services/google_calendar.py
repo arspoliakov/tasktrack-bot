@@ -49,8 +49,11 @@ class GoogleCalendarService:
                 "https://www.googleapis.com/oauth2/v3/userinfo",
                 headers={"Authorization": f"Bearer {tokens['access_token']}"},
             )
-            userinfo_response.raise_for_status()
-            tokens["userinfo"] = userinfo_response.json()
+            if userinfo_response.is_success:
+                tokens["userinfo"] = userinfo_response.json()
+            else:
+                # Calendar-only scopes may not allow userinfo. That's fine for this MVP.
+                tokens["userinfo"] = {}
 
         return tokens
 
@@ -89,4 +92,3 @@ class GoogleCalendarService:
             return event.get("htmlLink", "")
 
         return await asyncio.to_thread(_insert)
-
