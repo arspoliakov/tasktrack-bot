@@ -53,6 +53,7 @@ class TelegramBotService:
     def _register_handlers(self) -> None:
         self.dispatcher.message.register(self.cmd_start, Command("start"))
         self.dispatcher.message.register(self.cmd_help, Command("help"))
+        self.dispatcher.message.register(self.cmd_commands, Command("commands"))
         self.dispatcher.message.register(self.cmd_approve, Command("approve"))
         self.dispatcher.message.register(self.cmd_block, Command("block"))
         self.dispatcher.message.register(self.cmd_pending, Command("pending"))
@@ -317,6 +318,31 @@ class TelegramBotService:
         ]
         rows.append([InlineKeyboardButton(text="Отмена", callback_data=ActionCallback(action="cancel_create").pack())])
         return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def _user_help_text(self) -> str:
+        return (
+            "Вот что я умею:\n"
+            "/start — показать стартовое сообщение\n"
+            "/help — показать все команды и примеры\n\n"
+            "Что можно писать обычным текстом или голосом:\n"
+            "• создать событие: «созвон завтра в 15:00 на час»\n"
+            "• перенести событие: «перенеси созвон с Колей на 16:00»\n"
+            "• удалить событие: «отмени сегодняшнюю встречу с Колей»\n"
+            "• планы на день: «что у меня сегодня»\n"
+            "• ближайшее событие: «что дальше»\n"
+            "• реакция на черновик: «не в 15, а в 16»\n"
+        )
+
+    def _admin_help_text(self) -> str:
+        return (
+            self._user_help_text()
+            + "\nКоманды админа:\n"
+            "/approve <telegram_id> — одобрить пользователя\n"
+            "/block <telegram_id> — заблокировать пользователя\n"
+            "/pending — список ожидающих доступа\n"
+            "/users — последние пользователи\n"
+            "/stats — короткая статистика по использованию"
+        )
 
     async def _get_or_create_user(self, message: Message, session: AsyncSession) -> User:
         telegram_id = message.from_user.id
@@ -766,6 +792,13 @@ class TelegramBotService:
     async def cmd_help(self, message: Message) -> None:
         async with self.session_factory() as session:
             reply = "Я могу создать событие, перенести существующее, подсказать планы на сегодня и сказать, что у тебя дальше по календарю."
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
+
+    async def cmd_commands(self, message: Message) -> None:
+        async with self.session_factory() as session:
+            user = await self._load_user_by_telegram_id(message.from_user.id, session)
+            reply = self._admin_help_text() if user and user.status == UserStatus.ADMIN.value else self._user_help_text()
             await message.answer(reply)
             await self._remember(message.from_user.id, "assistant", reply, session)
 
