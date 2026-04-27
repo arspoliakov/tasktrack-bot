@@ -337,8 +337,8 @@ class TelegramBotService:
         return (
             self._user_help_text()
             + "\nКоманды админа:\n"
-            "/approve <telegram_id> — одобрить пользователя\n"
-            "/block <telegram_id> — заблокировать пользователя\n"
+            "/approve &lt;telegram_id&gt; — одобрить пользователя\n"
+            "/block &lt;telegram_id&gt; — заблокировать пользователя\n"
             "/pending — список ожидающих доступа\n"
             "/users — последние пользователи\n"
             "/stats — короткая статистика по использованию"
