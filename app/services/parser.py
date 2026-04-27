@@ -95,6 +95,36 @@ class TaskParser:
         ]
         return await self.client.chat_json(messages)
 
+    async def parse_events(self, text: str) -> dict[str, Any]:
+        now = datetime.now(self.timezone)
+        tomorrow = (now + timedelta(days=1)).date().isoformat()
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You extract one or more calendar events from Russian or English messages. "
+                    "Return only a JSON object with keys: "
+                    "should_create(boolean), events(array), "
+                    "needs_clarification(boolean), clarification_question(string). "
+                    "Each item in events must be an object with keys: "
+                    "title(string), description(string), start_iso(string), end_iso(string), timezone(string). "
+                    "If the message contains several different planned tasks, appointments, or meetings, return all of them in events. "
+                    "If the message contains only one event, return a one-item events array. "
+                    "If the message is not a request to create calendar events, set should_create=false and events=[]. "
+                    f"Assume timezone {self.settings.default_timezone}. "
+                    f"Current datetime is {now.isoformat()}. Tomorrow date is {tomorrow}. "
+                    "For relative expressions like 'in 30 minutes', 'after that', 'in the evening', "
+                    "calculate from the current datetime above in that timezone. "
+                    "Always return start_iso and end_iso with an explicit timezone offset. "
+                    "If no exact end time is given, infer a reasonable duration. "
+                    "If at least one requested event has no usable time, set needs_clarification=true instead of guessing badly. "
+                    "clarification_question must always be friendly, short, and in Russian, speaking to the user with 'ты'."
+                ),
+            },
+            {"role": "user", "content": text},
+        ]
+        return await self.client.chat_json(messages)
+
     async def parse_event(self, text: str) -> dict[str, Any]:
         now = datetime.now(self.timezone)
         tomorrow = (now + timedelta(days=1)).date().isoformat()

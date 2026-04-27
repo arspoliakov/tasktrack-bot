@@ -248,6 +248,20 @@ class TelegramBotService:
         return options[offset : offset + self.SUGGESTION_PAGE_SIZE]
 
     def _describe_pending(self, pending: dict[str, Any]) -> str:
+        if pending.get("items"):
+            lines: list[str] = []
+            for index, item in enumerate(pending["items"], start=1):
+                title = escape(item.get("title") or "Без названия")
+                start_iso = item.get("start_iso")
+                end_iso = item.get("end_iso")
+                if start_iso and end_iso:
+                    start_at = self._ensure_tz(datetime.fromisoformat(start_iso))
+                    end_at = self._ensure_tz(datetime.fromisoformat(end_iso))
+                    lines.append(f"{index}. {title} — {self._format_dt(start_at)} — {self._format_dt(end_at)}")
+                else:
+                    lines.append(f"{index}. {title}")
+            return "\n".join(lines)
+
         title = escape(pending.get("title") or "Без названия")
         start_iso = pending.get("start_iso")
         end_iso = pending.get("end_iso")
@@ -566,6 +580,8 @@ class TelegramBotService:
     ) -> bool:
         pending = await self._get_pending_confirmation(message.from_user.id, session)
         if not pending:
+            return False
+        if pending.get("mode") == "create_batch":
             return False
 
         text = (message.text or "").strip()
@@ -1041,6 +1057,64 @@ class TelegramBotService:
                     await callback.answer("У меня уже нет этого черновика.", show_alert=True)
                     return
                 mode = pending.get("mode", "create")
+                if mode == "create_batch":
+                    created: list[tuple[str, str]] = []
+                    skipped: list[str] = []
+                    for item in pending.get("items", []):
+                        item_timezone = item.get("timezone") or self.settings.default_timezone
+                        start_at = self._ensure_tz(datetime.fromisoformat(item["start_iso"]))
+                        end_at = self._ensure_tz(datetime.fromisoformat(item["end_iso"]))
+                        conflicts = await self.calendar_service.find_conflicts(
+                            access_token=google_account.access_token,
+                            refresh_token=google_account.refresh_token,
+                            start_at=start_at,
+                            end_at=end_at,
+                            timezone=item_timezone,
+                        )
+                        if conflicts:
+                            skipped.append(f"• {escape(item['title'])} — {self._format_dt(start_at)}")
+                            continue
+
+                        link = await self._create_calendar_entry(
+                            access_token=google_account.access_token,
+                            refresh_token=google_account.refresh_token,
+                            title=item["title"],
+                            description=item["description"],
+                            start_iso=item["start_iso"],
+                            end_iso=item["end_iso"],
+                            timezone=item_timezone,
+                        )
+                        created.append((item["title"], link))
+
+                    await self._set_pending_confirmation(user_id, None, session)
+                    await callback.message.edit_reply_markup(reply_markup=None)
+                    lines: list[str] = []
+                    if created:
+                        lines.append("Готово, создал вот это:")
+                        lines.extend(f"• <a href=\"{link}\">{escape(title)}</a>" for title, link in created)
+                    if skipped:
+                        lines.append("")
+                        lines.append("Эти события пока пропустил, потому что их слот уже занят:")
+                        lines.extend(skipped)
+                    if not created and skipped:
+                        lines.append("")
+                        lines.append("Если хочешь, можем отдельно подобрать для них свободное время.")
+                    reply = "\n".join(lines) if lines else "Похоже, тут пока нечего создавать."
+                    await callback.message.answer(reply)
+                    await self._remember(
+                        user_id,
+                        "assistant",
+                        f"Обработал пакет из {len(pending.get('items', []))} событий: создал {len(created)}, пропустил {len(skipped)}.",
+                        session,
+                    )
+                    await self._log_usage(
+                        session,
+                        user_id,
+                        "event_batch_processed",
+                        {"created": len(created), "skipped": len(skipped)},
+                    )
+                    await callback.answer()
+                    return
                 if mode == "update":
                     link = await self.calendar_service.update_event(
                         access_token=google_account.access_token,
@@ -1187,6 +1261,55 @@ class TelegramBotService:
     ) -> None:
         memory = await self._memory_prompt(message.from_user.id, session)
         parsing_input = text if not memory else f"Recent conversation:\n{memory}\n\nCurrent message:\n{text}"
+        parsed_multi = await self.parser.parse_events(parsing_input)
+        if parsed_multi.get("needs_clarification"):
+            reply = parsed_multi.get("clarification_question") or "Нужно чуть точнее понять дату или время."
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
+            return
+
+        multi_events = parsed_multi.get("events") or []
+        if parsed_multi.get("should_create") and len(multi_events) > 1:
+            items: list[dict[str, Any]] = []
+            for raw_item in multi_events:
+                start_iso = raw_item.get("start_iso")
+                end_iso = raw_item.get("end_iso")
+                if not start_iso or not end_iso:
+                    reply = "Похоже, в одном из событий не хватает времени. Давай уточним формулировку чуть точнее."
+                    await message.answer(reply)
+                    await self._remember(message.from_user.id, "assistant", reply, session)
+                    return
+
+                timezone = raw_item.get("timezone") or self.settings.default_timezone
+                start_at = self._ensure_tz(datetime.fromisoformat(start_iso))
+                end_at = self._ensure_tz(datetime.fromisoformat(end_iso))
+                items.append(
+                    {
+                        "title": raw_item.get("title") or "Новое событие",
+                        "description": raw_item.get("description") or text,
+                        "start_iso": start_at.isoformat(),
+                        "end_iso": end_at.isoformat(),
+                        "timezone": timezone,
+                    }
+                )
+
+            await self._set_pending_confirmation(
+                message.from_user.id,
+                {
+                    "mode": "create_batch",
+                    "items": items,
+                },
+                session,
+            )
+            reply = (
+                "Понял так, нужно создать сразу несколько событий:\n"
+                f"{self._describe_pending({'items': items})}\n\n"
+                "Если всё так, жми кнопку ниже."
+            )
+            await message.answer(reply, reply_markup=self._confirm_keyboard())
+            await self._remember(message.from_user.id, "assistant", f"Предложил создать {len(items)} событий одним пакетом.", session)
+            return
+
         parsed = await self.parser.parse_event(parsing_input)
         if parsed.get("needs_clarification"):
             reply = parsed.get("clarification_question") or "Нужно чуть точнее понять дату или время."
