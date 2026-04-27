@@ -582,6 +582,134 @@ class TelegramBotService:
 
         return False
 
+    async def _handle_pending_confirmation_decision(
+        self,
+        *,
+        message: Message,
+        access_token: str | None,
+        refresh_token: str,
+        session: AsyncSession,
+    ) -> bool:
+        pending = await self._get_pending_confirmation(message.from_user.id, session)
+        if not pending:
+            return False
+
+        text = (message.text or "").strip()
+        if not text:
+            return False
+
+        if self._is_no(text):
+            await self._set_pending_confirmation(message.from_user.id, None, session)
+            reply = "Окей, не создаю и не меняю. Если хочешь, можем переформулировать по-другому."
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
+            return True
+
+        if not self._is_yes(text):
+            return False
+
+        mode = pending.get("mode", "create")
+        if mode == "create_batch":
+            created: list[tuple[str, str]] = []
+            skipped: list[str] = []
+            for item in pending.get("items", []):
+                item_timezone = item.get("timezone") or self.settings.default_timezone
+                start_at = self._ensure_tz(datetime.fromisoformat(item["start_iso"]))
+                end_at = self._ensure_tz(datetime.fromisoformat(item["end_iso"]))
+                conflicts = await self.calendar_service.find_conflicts(
+                    access_token=access_token,
+                    refresh_token=refresh_token,
+                    start_at=start_at,
+                    end_at=end_at,
+                    timezone=item_timezone,
+                )
+                if conflicts:
+                    skipped.append(f"• {escape(item['title'])} — {self._format_dt(start_at)}")
+                    continue
+
+                link = await self._create_calendar_entry(
+                    access_token=access_token,
+                    refresh_token=refresh_token,
+                    title=item["title"],
+                    description=item["description"],
+                    start_iso=item["start_iso"],
+                    end_iso=item["end_iso"],
+                    timezone=item_timezone,
+                )
+                created.append((item["title"], link))
+
+            await self._set_pending_confirmation(message.from_user.id, None, session)
+            lines: list[str] = []
+            if created:
+                lines.append("Готово, создал вот это:")
+                lines.extend(f"• <a href=\"{link}\">{escape(title)}</a>" for title, link in created)
+            if skipped:
+                lines.append("")
+                lines.append("Эти события пока пропустил, потому что их слот уже занят:")
+                lines.extend(skipped)
+            if not created and skipped:
+                lines.append("")
+                lines.append("Если хочешь, можем отдельно подобрать для них свободное время.")
+            reply = "\n".join(lines) if lines else "Похоже, тут пока нечего создавать."
+            await message.answer(reply)
+            await self._remember(
+                message.from_user.id,
+                "assistant",
+                f"Обработал пакет из {len(pending.get('items', []))} событий: создал {len(created)}, пропустил {len(skipped)}.",
+                session,
+            )
+            await self._log_usage(
+                session,
+                message.from_user.id,
+                "event_batch_processed",
+                {"created": len(created), "skipped": len(skipped)},
+            )
+            return True
+
+        if mode == "update":
+            link = await self.calendar_service.update_event(
+                access_token=access_token,
+                refresh_token=refresh_token,
+                event_id=pending["event_id"],
+                title=pending.get("title"),
+                description=pending.get("description"),
+                start_iso=pending.get("start_iso"),
+                end_iso=pending.get("end_iso"),
+                timezone=pending["timezone"],
+            )
+            await self._set_pending_confirmation(message.from_user.id, None, session)
+            reply = f"Готово, обновил событие.\n<a href=\"{link}\">Открыть в Google Calendar</a>"
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", f"Обновил событие {pending['title']}.", session)
+            await self._log_usage(
+                session,
+                message.from_user.id,
+                "event_updated",
+                {"title": pending["title"], "start_iso": pending.get("start_iso")},
+            )
+            return True
+
+        link = await self._create_calendar_entry(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            title=pending["title"],
+            description=pending["description"],
+            start_iso=pending["start_iso"],
+            end_iso=pending["end_iso"],
+            timezone=pending["timezone"],
+        )
+        await self._set_pending_confirmation(message.from_user.id, None, session)
+        reply = f"Готово, событие создал.\n<a href=\"{link}\">Открыть в Google Calendar</a>"
+        await message.answer(reply)
+        await self._remember(message.from_user.id, "assistant", f"Создал событие {pending['title']}.", session)
+        await self._log_usage(
+            session,
+            message.from_user.id,
+            "event_created",
+            {"title": pending["title"], "start_iso": pending.get("start_iso")},
+        )
+        return True
+
     async def _handle_pending_confirmation_update(
         self,
         *,
@@ -947,6 +1075,14 @@ class TelegramBotService:
             google_account = await self._get_google_account(user.id, session)
 
             if await self._handle_pending_suggestion(
+                message=message,
+                access_token=google_account.access_token,
+                refresh_token=google_account.refresh_token,
+                session=session,
+            ):
+                return
+
+            if await self._handle_pending_confirmation_decision(
                 message=message,
                 access_token=google_account.access_token,
                 refresh_token=google_account.refresh_token,
