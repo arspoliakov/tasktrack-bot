@@ -307,6 +307,16 @@ class TelegramBotService:
         offset = pending.get("offset", 0)
         total = len(pending.get("options", []))
 
+        if pending.get("requested_start_iso") and pending.get("requested_end_iso"):
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text="Поставить поверх",
+                        callback_data=ActionCallback(action="allow_overlap").pack(),
+                    )
+                ]
+            )
+
         for local_index, option in enumerate(visible):
             rows.append(
                 [
@@ -1165,6 +1175,58 @@ class TelegramBotService:
                 await callback.answer()
                 return
 
+            if callback_data.action == "allow_overlap":
+                pending = await self._get_pending_suggestions(user_id, session)
+                if not pending:
+                    await callback.answer("Подсказка уже устарела.", show_alert=True)
+                    return
+                mode = pending.get("mode", "create")
+                requested_start_iso = pending.get("requested_start_iso")
+                requested_end_iso = pending.get("requested_end_iso")
+                timezone = pending.get("timezone") or self.settings.default_timezone
+                if not requested_start_iso or not requested_end_iso:
+                    await callback.answer("Не нашел исходный слот.", show_alert=True)
+                    return
+
+                if mode == "update":
+                    link = await self.calendar_service.update_event(
+                        access_token=google_account.access_token,
+                        refresh_token=google_account.refresh_token,
+                        event_id=pending["event_id"],
+                        title=pending["title"],
+                        description=pending["description"],
+                        start_iso=requested_start_iso,
+                        end_iso=requested_end_iso,
+                        timezone=timezone,
+                    )
+                    reply = f"Ок, перенес поверх на {self._format_dt(self._ensure_tz(datetime.fromisoformat(requested_start_iso)))}.\n<a href=\"{link}\">Открыть событие в Google Calendar</a>"
+                    usage_kind = "event_updated_overlap"
+                else:
+                    link = await self._create_calendar_entry(
+                        access_token=google_account.access_token,
+                        refresh_token=google_account.refresh_token,
+                        title=pending["title"],
+                        description=pending["description"],
+                        start_iso=requested_start_iso,
+                        end_iso=requested_end_iso,
+                        timezone=timezone,
+                    )
+                    reply = f"Ок, поставил поверх на {self._format_dt(self._ensure_tz(datetime.fromisoformat(requested_start_iso)))}.\n<a href=\"{link}\">Открыть событие в Google Calendar</a>"
+                    usage_kind = "event_created_overlap"
+
+                await self._set_pending_suggestions(user_id, None, session)
+                await callback.message.edit_reply_markup(reply_markup=None)
+                await callback.message.answer(reply)
+                await self._remember(user_id, "assistant", reply, session)
+                await self._log_usage(
+                    session,
+                    user_id,
+                    usage_kind,
+                    {"title": pending["title"], "start_iso": requested_start_iso},
+                )
+                await callback.answer()
+                return
+
             if callback_data.action == "more_suggestions":
                 pending = await self._get_pending_suggestions(user_id, session)
                 if not pending:
@@ -1355,6 +1417,9 @@ class TelegramBotService:
                     "mode": "create",
                     "title": parsed.get("title") or "Новое событие",
                     "description": parsed.get("description") or text,
+                    "requested_start_iso": start_at.isoformat(),
+                    "requested_end_iso": end_at.isoformat(),
+                    "timezone": timezone,
                     "options": options,
                     "offset": 0,
                 }
@@ -1365,6 +1430,7 @@ class TelegramBotService:
                 reply = (
                     f"Смотри, в {time_text} у тебя уже стоит «{conflict_title}».\n"
                     f"Зато могу поставить на {visible[0]['label']}.{tail}\n"
+                    "Если хочешь, могу и поставить прямо поверх.\n"
                     "Выбирай вариант кнопкой ниже."
                 )
                 await message.answer(reply, reply_markup=self._suggestion_keyboard(pending))
@@ -1537,6 +1603,9 @@ class TelegramBotService:
                     "event_id": target["id"],
                     "title": new_title,
                     "description": new_description,
+                    "requested_start_iso": new_start.isoformat(),
+                    "requested_end_iso": new_end.isoformat(),
+                    "timezone": timezone,
                     "options": options,
                     "offset": 0,
                 }
