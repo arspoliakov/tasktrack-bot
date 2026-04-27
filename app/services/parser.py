@@ -22,9 +22,10 @@ class TaskParser:
                 "content": (
                     "You route Telegram calendar assistant messages. "
                     "Return only JSON with keys: intent, confidence, reply_style, clarification_question. "
-                    "Allowed intents: create_event, cancel_event, today_schedule, next_event, general_help, clarify, other. "
+                    "Allowed intents: create_event, update_event, cancel_event, today_schedule, next_event, general_help, clarify, other. "
                     "reply_style must be one of: casual, neutral. "
-                    "Use create_event when the user wants to add, move, reschedule, or plan a calendar event. "
+                    "Use create_event when the user wants to add or plan a brand new calendar event. "
+                    "Use update_event when the user wants to move, reschedule, rename, shorten, lengthen, or otherwise change an existing event. "
                     "Use cancel_event when the user wants to cancel, delete, remove, or drop an event from the calendar. "
                     "Use today_schedule when the user asks what is planned today. "
                     "Use next_event when the user asks what is next, what is happening now, or what comes after. "
@@ -34,6 +35,36 @@ class TaskParser:
                     "clarification_question must be empty unless intent=clarify. "
                     "If intent=clarify, clarification_question must be friendly, short, and in Russian, addressing the user as 'ты'. "
                     f"Current datetime is {now.isoformat()} in timezone {self.settings.default_timezone}."
+                ),
+            },
+            {"role": "user", "content": text},
+        ]
+        return await self.client.chat_json(messages)
+
+    async def parse_update_request(self, text: str) -> dict[str, Any]:
+        now = datetime.now(self.timezone)
+        tomorrow = (now + timedelta(days=1)).date().isoformat()
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You extract calendar event update requests from Russian or English messages. "
+                    "Return only JSON with keys: should_update(boolean), title_query(string), "
+                    "search_from_iso(string), search_to_iso(string), "
+                    "new_title(string), new_description(string), new_start_iso(string), new_end_iso(string), "
+                    "timezone(string), needs_clarification(boolean), clarification_question(string). "
+                    f"Assume timezone {self.settings.default_timezone}. "
+                    f"Current datetime is {now.isoformat()}. Tomorrow date is {tomorrow}. "
+                    "Use title_query to identify the existing event that should be changed. "
+                    "Use search_from_iso and search_to_iso as the time window where the existing event should be searched. "
+                    "If the user mentions today or tomorrow, use that to narrow the search window. "
+                    "If the user gives no explicit search date, default to now through 7 days ahead. "
+                    "Use new_start_iso and new_end_iso for the desired updated time. "
+                    "If the user only changes title, keep new_start_iso and new_end_iso empty strings. "
+                    "If the user only changes time, keep new_title empty unless they explicitly renamed it. "
+                    "Always keep explicit timezone offsets in new_start_iso and new_end_iso when they are not empty. "
+                    "If it is unclear which existing event should be updated or what should be changed, set needs_clarification=true. "
+                    "clarification_question must be friendly, short, and in Russian, speaking to the user with 'ты'."
                 ),
             },
             {"role": "user", "content": text},

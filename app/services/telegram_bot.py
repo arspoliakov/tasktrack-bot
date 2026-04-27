@@ -12,11 +12,11 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
-from app.models import ConversationState, GoogleAccount, User, UserStatus
+from app.models import ConversationState, GoogleAccount, SelectionState, UsageEvent, User, UserStatus
 from app.security import StateSigner
 from app.services.deepinfra import DeepInfraClient
 from app.services.google_calendar import GoogleCalendarService
@@ -57,6 +57,7 @@ class TelegramBotService:
         self.dispatcher.message.register(self.cmd_block, Command("block"))
         self.dispatcher.message.register(self.cmd_pending, Command("pending"))
         self.dispatcher.message.register(self.cmd_users, Command("users"))
+        self.dispatcher.message.register(self.cmd_stats, Command("stats"))
         self.dispatcher.message.register(self.handle_voice, F.voice)
         self.dispatcher.message.register(self.handle_text, F.text)
         self.dispatcher.callback_query.register(self.handle_action_callback, ActionCallback.filter())
@@ -72,6 +73,9 @@ class TelegramBotService:
 
     def _format_dt(self, value: datetime) -> str:
         return value.astimezone(self._tz()).strftime("%d.%m %H:%M")
+
+    def _format_time(self, value: datetime) -> str:
+        return value.astimezone(self._tz()).strftime("%H:%M")
 
     def _ensure_tz(self, value: datetime) -> datetime:
         return value if value.tzinfo else value.replace(tzinfo=self._tz())
@@ -194,10 +198,83 @@ class TelegramBotService:
         state.pending_suggestions_json = None
         await session.commit()
 
+    async def _get_selection_state(self, telegram_id: int, session: AsyncSession) -> dict[str, Any] | None:
+        result = await session.execute(select(SelectionState).where(SelectionState.telegram_id == telegram_id))
+        state = result.scalar_one_or_none()
+        if not state:
+            return None
+        return self._loads_json(state.payload_json, None)
+
+    async def _set_selection_state(
+        self,
+        telegram_id: int,
+        payload: dict[str, Any] | None,
+        session: AsyncSession,
+    ) -> None:
+        result = await session.execute(select(SelectionState).where(SelectionState.telegram_id == telegram_id))
+        state = result.scalar_one_or_none()
+        if payload is None:
+            if state:
+                await session.delete(state)
+                await session.commit()
+            return
+        if not state:
+            state = SelectionState(telegram_id=telegram_id, payload_json=self._dumps_json(payload) or "{}")
+            session.add(state)
+        else:
+            state.payload_json = self._dumps_json(payload) or "{}"
+        await session.commit()
+
+    async def _log_usage(
+        self,
+        session: AsyncSession,
+        telegram_id: int,
+        kind: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        session.add(
+            UsageEvent(
+                telegram_id=telegram_id,
+                kind=kind,
+                payload_json=self._dumps_json(payload),
+            )
+        )
+        await session.commit()
+
     def _current_suggestion_options(self, pending: dict[str, Any]) -> list[dict[str, Any]]:
         options = pending.get("options", [])
         offset = pending.get("offset", 0)
         return options[offset : offset + self.SUGGESTION_PAGE_SIZE]
+
+    def _describe_pending(self, pending: dict[str, Any]) -> str:
+        title = escape(pending.get("title") or "Без названия")
+        start_iso = pending.get("start_iso")
+        end_iso = pending.get("end_iso")
+        if start_iso and end_iso:
+            start_at = self._ensure_tz(datetime.fromisoformat(start_iso))
+            end_at = self._ensure_tz(datetime.fromisoformat(end_iso))
+            return f"• {title}\n• {self._format_dt(start_at)} — {self._format_dt(end_at)}"
+        return f"• {title}"
+
+    def _free_windows_text(self, now: datetime, day_end: datetime, events: list[dict]) -> str:
+        busy_ranges: list[tuple[datetime, datetime]] = []
+        for event in events:
+            start = self.calendar_service.parse_event_datetime(event, self.settings.default_timezone, "start")
+            end = self.calendar_service.parse_event_datetime(event, self.settings.default_timezone, "end")
+            if start and end and end > now:
+                busy_ranges.append((max(start, now), end))
+
+        busy_ranges.sort(key=lambda item: item[0])
+        cursor = now
+        windows: list[str] = []
+        for start, end in busy_ranges:
+            if start > cursor:
+                windows.append(f"{self._format_time(cursor)}–{self._format_time(start)}")
+            if end > cursor:
+                cursor = end
+        if cursor < day_end:
+            windows.append(f"{self._format_time(cursor)}–{self._format_time(day_end)}")
+        return ", ".join(windows[:3])
 
     def _confirm_keyboard(self) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
@@ -230,6 +307,14 @@ class TelegramBotService:
                 [InlineKeyboardButton(text="Еще варианты", callback_data=ActionCallback(action="more_suggestions").pack())]
             )
 
+        rows.append([InlineKeyboardButton(text="Отмена", callback_data=ActionCallback(action="cancel_create").pack())])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def _selection_keyboard(self, options: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+        rows = [
+            [InlineKeyboardButton(text=option["label"], callback_data=ActionCallback(action="pick_selection", option=index).pack())]
+            for index, option in enumerate(options[:5])
+        ]
         rows.append([InlineKeyboardButton(text="Отмена", callback_data=ActionCallback(action="cancel_create").pack())])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -331,7 +416,10 @@ class TelegramBotService:
             start = self.calendar_service.parse_event_datetime(event, self.settings.default_timezone, "start")
             summary = escape(event.get("summary") or "Без названия")
             lines.append(f"{start.strftime('%H:%M') if start else 'весь день'} — {summary}")
-        reply = "На сегодня у тебя вот что:\n" + "\n".join(lines)
+        free_windows = self._free_windows_text(now, day_end, events)
+        prefix = f"На сегодня у тебя {len(events)} {'событие' if len(events) == 1 else 'события' if 2 <= len(events) <= 4 else 'событий'}:\n"
+        suffix = f"\n\nСвободные окна дальше сегодня: {free_windows}" if free_windows else ""
+        reply = prefix + "\n".join(lines) + suffix
         await message.answer(reply)
         await self._remember(message.from_user.id, "assistant", reply, session)
 
@@ -358,11 +446,26 @@ class TelegramBotService:
         start = self.calendar_service.parse_event_datetime(event, self.settings.default_timezone, "start")
         end = self.calendar_service.parse_event_datetime(event, self.settings.default_timezone, "end")
         summary = escape(event.get("summary") or "Событие без названия")
+        after_events = await self.calendar_service.list_events(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            time_min=(end or now),
+            time_max=now + timedelta(days=1),
+            timezone=self.settings.default_timezone,
+            limit=2,
+        )
+        follow_up = ""
+        if len(after_events) > 1:
+            after_next = after_events[1]
+            after_next_start = self.calendar_service.parse_event_datetime(after_next, self.settings.default_timezone, "start")
+            after_next_summary = escape(after_next.get("summary") or "что-то еще")
+            if after_next_start:
+                follow_up = f" Потом еще «{after_next_summary}» в {self._format_time(after_next_start)}."
 
         if start and end and start <= now <= end:
-            reply = f"Сейчас у тебя идет «{summary}» до {end.strftime('%H:%M')}."
+            reply = f"Сейчас у тебя идет «{summary}» до {end.strftime('%H:%M')}.{follow_up}"
         elif start:
-            reply = f"Дальше у тебя «{summary}» в {self._format_dt(start)}."
+            reply = f"Дальше у тебя «{summary}» в {self._format_dt(start)}.{follow_up}"
         else:
             reply = f"Дальше у тебя событие «{summary}»."
         await message.answer(reply)
@@ -465,6 +568,8 @@ class TelegramBotService:
         await self._set_pending_confirmation(
             message.from_user.id,
             {
+                "mode": pending.get("mode", "create"),
+                "event_id": pending.get("event_id"),
                 "title": title,
                 "description": description,
                 "start_iso": start_at.isoformat(),
@@ -529,6 +634,7 @@ class TelegramBotService:
         routing = await self.parser.classify_intent(routing_input)
         intent = routing.get("intent", "other")
         logger.info("intent_detected user=%s intent=%s text=%r", message.from_user.id, intent, text[:120])
+        await self._log_usage(session, message.from_user.id, f"intent:{intent}")
 
         if intent == "today_schedule":
             await self._answer_today_schedule(
@@ -550,9 +656,10 @@ class TelegramBotService:
 
         if intent == "general_help":
             reply = (
-                "Я могу создать событие, подсказать планы на сегодня и сказать, что у тебя дальше по календарю.\n"
+                "Я могу создать событие, перенести существующее, подсказать планы на сегодня и сказать, что у тебя дальше по календарю.\n"
                 "Например:\n"
                 "• «созвон завтра в 15:00 на час»\n"
+                "• «перенеси созвон с Колей на 16:00»\n"
                 "• «что у меня сегодня»\n"
                 "• «что дальше»"
             )
@@ -568,6 +675,16 @@ class TelegramBotService:
 
         if intent == "create_event":
             await self._process_event_request(
+                message=message,
+                text=text,
+                refresh_token=refresh_token,
+                access_token=access_token,
+                session=session,
+            )
+            return
+
+        if intent == "update_event":
+            await self._process_update_request(
                 message=message,
                 text=text,
                 refresh_token=refresh_token,
@@ -639,6 +756,7 @@ class TelegramBotService:
                 "Готово, все подключено.\n"
                 "Можешь писать или отправлять голосовые вроде:\n"
                 "• «созвон завтра в 15:00 на час»\n"
+                "• «перенеси созвон с Колей на 16:00»\n"
                 "• «что у меня сегодня»\n"
                 "• «что дальше»"
             )
@@ -647,7 +765,7 @@ class TelegramBotService:
 
     async def cmd_help(self, message: Message) -> None:
         async with self.session_factory() as session:
-            reply = "Я могу создать событие, подсказать планы на сегодня и сказать, что у тебя дальше по календарю."
+            reply = "Я могу создать событие, перенести существующее, подсказать планы на сегодня и сказать, что у тебя дальше по календарю."
             await message.answer(reply)
             await self._remember(message.from_user.id, "assistant", reply, session)
 
@@ -734,6 +852,31 @@ class TelegramBotService:
         ]
         await message.answer("Последние пользователи:\n" + "\n".join(lines))
 
+    async def cmd_stats(self, message: Message) -> None:
+        if message.from_user.id != self.settings.admin_telegram_id:
+            await message.answer("Команда только для админа.")
+            return
+        async with self.session_factory() as session:
+            total_users = (await session.execute(select(func.count()).select_from(User))).scalar_one()
+            total_connected = (
+                await session.execute(select(func.count()).select_from(User).where(User.google_connected.is_(True)))
+            ).scalar_one()
+            rows = (
+                await session.execute(
+                    select(UsageEvent.kind, func.count())
+                    .group_by(UsageEvent.kind)
+                    .order_by(func.count().desc())
+                )
+            ).all()
+        lines = [f"• {kind}: {count}" for kind, count in rows[:12]]
+        reply = (
+            f"Пользователей: {total_users}\n"
+            f"С подключенным Google: {total_connected}\n\n"
+            "События и интенты:\n"
+            + ("\n".join(lines) if lines else "Пока пусто.")
+        )
+        await message.answer(reply)
+
     async def handle_text(self, message: Message) -> None:
         if (message.text or "").startswith("/"):
             return
@@ -797,6 +940,7 @@ class TelegramBotService:
 
             if callback_data.action == "cancel_create":
                 await self._clear_pending_state(user_id, session)
+                await self._set_selection_state(user_id, None, session)
                 await callback.message.edit_reply_markup(reply_markup=None)
                 reply = "Окей, ничего не создаю."
                 await callback.message.answer(reply)
@@ -804,26 +948,113 @@ class TelegramBotService:
                 await callback.answer()
                 return
 
+            if callback_data.action == "pick_selection":
+                selection = await self._get_selection_state(user_id, session)
+                if not selection:
+                    await callback.answer("Выбор уже устарел.", show_alert=True)
+                    return
+                index = callback_data.option or 0
+                options = selection.get("options", [])
+                if index >= len(options):
+                    await callback.answer("Не нашел такой вариант.", show_alert=True)
+                    return
+                option = options[index]
+                mode = selection.get("mode")
+                await self._set_selection_state(user_id, None, session)
+                await callback.message.edit_reply_markup(reply_markup=None)
+
+                if mode == "cancel":
+                    await self.calendar_service.delete_event(
+                        access_token=google_account.access_token,
+                        refresh_token=google_account.refresh_token,
+                        event_id=option["event_id"],
+                    )
+                    reply = f"Готово, удалил «{escape(option['title'])}» из календаря."
+                    await callback.message.answer(reply)
+                    await self._remember(user_id, "assistant", reply, session)
+                    await self._log_usage(
+                        session,
+                        user_id,
+                        "event_deleted",
+                        {"title": option["title"], "event_id": option["event_id"]},
+                    )
+                    await callback.answer()
+                    return
+
+                if mode == "update":
+                    pending = {
+                        "mode": "update",
+                        "event_id": option["event_id"],
+                        "title": selection["new_title"] or option["title"],
+                        "description": selection["new_description"] or option.get("current_description", ""),
+                        "start_iso": selection["new_start_iso"] or option.get("current_start_iso", ""),
+                        "end_iso": selection["new_end_iso"] or option.get("current_end_iso", ""),
+                        "timezone": selection["timezone"],
+                    }
+                    await self._set_pending_confirmation(user_id, pending, session)
+                    reply = (
+                        f"Понял, обновляем «{escape(option['title'])}»:\n"
+                        f"{self._describe_pending(pending)}\n\n"
+                        "Если все так, жми кнопку ниже."
+                    )
+                    await callback.message.answer(reply, reply_markup=self._confirm_keyboard())
+                    await self._remember(user_id, "assistant", reply, session)
+                    await callback.answer()
+                    return
+
             if callback_data.action == "confirm_create":
                 pending = await self._get_pending_confirmation(user_id, session)
                 if not pending:
                     await callback.answer("У меня уже нет этого черновика.", show_alert=True)
                     return
-                link = await self._create_calendar_entry(
-                    access_token=google_account.access_token,
-                    refresh_token=google_account.refresh_token,
-                    title=pending["title"],
-                    description=pending["description"],
-                    start_iso=pending["start_iso"],
-                    end_iso=pending["end_iso"],
-                    timezone=pending["timezone"],
-                )
+                mode = pending.get("mode", "create")
+                if mode == "update":
+                    link = await self.calendar_service.update_event(
+                        access_token=google_account.access_token,
+                        refresh_token=google_account.refresh_token,
+                        event_id=pending["event_id"],
+                        title=pending.get("title"),
+                        description=pending.get("description"),
+                        start_iso=pending.get("start_iso"),
+                        end_iso=pending.get("end_iso"),
+                        timezone=pending["timezone"],
+                    )
+                else:
+                    link = await self._create_calendar_entry(
+                        access_token=google_account.access_token,
+                        refresh_token=google_account.refresh_token,
+                        title=pending["title"],
+                        description=pending["description"],
+                        start_iso=pending["start_iso"],
+                        end_iso=pending["end_iso"],
+                        timezone=pending["timezone"],
+                    )
                 await self._set_pending_confirmation(user_id, None, session)
                 await callback.message.edit_reply_markup(reply_markup=None)
-                reply = f"Готово, событие создал.\n<a href=\"{link}\">Открыть в Google Calendar</a>"
+                reply = (
+                    f"Готово, событие {'обновил' if mode == 'update' else 'создал'}.\n"
+                    f"<a href=\"{link}\">Открыть в Google Calendar</a>"
+                )
                 await callback.message.answer(reply)
-                await self._remember(user_id, "assistant", f"Создал событие {pending['title']}.", session)
-                logger.info("event_created user=%s title=%r start=%s", user_id, pending["title"], pending["start_iso"])
+                await self._remember(
+                    user_id,
+                    "assistant",
+                    f"{'Обновил' if mode == 'update' else 'Создал'} событие {pending['title']}.",
+                    session,
+                )
+                logger.info(
+                    "%s user=%s title=%r start=%s",
+                    "event_updated" if mode == "update" else "event_created",
+                    user_id,
+                    pending["title"],
+                    pending.get("start_iso"),
+                )
+                await self._log_usage(
+                    session,
+                    user_id,
+                    "event_updated" if mode == "update" else "event_created",
+                    {"title": pending["title"], "start_iso": pending.get("start_iso")},
+                )
                 await callback.answer()
                 return
 
@@ -864,21 +1095,52 @@ class TelegramBotService:
                     await callback.answer("Не нашел такой вариант.", show_alert=True)
                     return
                 option = options[index]
-                link = await self._create_calendar_entry(
-                    access_token=google_account.access_token,
-                    refresh_token=google_account.refresh_token,
-                    title=pending["title"],
-                    description=pending["description"],
-                    start_iso=option["start_iso"],
-                    end_iso=option["end_iso"],
-                    timezone=self.settings.default_timezone,
-                )
+                mode = pending.get("mode", "create")
+                if mode == "update":
+                    link = await self.calendar_service.update_event(
+                        access_token=google_account.access_token,
+                        refresh_token=google_account.refresh_token,
+                        event_id=pending["event_id"],
+                        title=pending["title"],
+                        description=pending["description"],
+                        start_iso=option["start_iso"],
+                        end_iso=option["end_iso"],
+                        timezone=self.settings.default_timezone,
+                    )
+                else:
+                    link = await self._create_calendar_entry(
+                        access_token=google_account.access_token,
+                        refresh_token=google_account.refresh_token,
+                        title=pending["title"],
+                        description=pending["description"],
+                        start_iso=option["start_iso"],
+                        end_iso=option["end_iso"],
+                        timezone=self.settings.default_timezone,
+                    )
                 await self._set_pending_suggestions(user_id, None, session)
                 await callback.message.edit_reply_markup(reply_markup=None)
-                reply = f"Супер, поставил на {option['label']}.\n<a href=\"{link}\">Открыть событие в Google Calendar</a>"
+                verb = "перенес" if mode == "update" else "поставил"
+                reply = f"Супер, {verb} на {option['label']}.\n<a href=\"{link}\">Открыть событие в Google Calendar</a>"
                 await callback.message.answer(reply)
-                await self._remember(user_id, "assistant", f"Поставил событие на {option['label']}.", session)
-                logger.info("event_created_from_suggestion user=%s title=%r start=%s", user_id, pending["title"], option["start_iso"])
+                await self._remember(
+                    user_id,
+                    "assistant",
+                    f"{'Перенес' if mode == 'update' else 'Поставил'} событие на {option['label']}.",
+                    session,
+                )
+                logger.info(
+                    "%s user=%s title=%r start=%s",
+                    "event_updated_from_suggestion" if mode == "update" else "event_created_from_suggestion",
+                    user_id,
+                    pending["title"],
+                    option["start_iso"],
+                )
+                await self._log_usage(
+                    session,
+                    user_id,
+                    "event_updated_from_suggestion" if mode == "update" else "event_created_from_suggestion",
+                    {"title": pending["title"], "start_iso": option["start_iso"]},
+                )
                 await callback.answer()
 
     async def _process_event_request(
@@ -934,6 +1196,7 @@ class TelegramBotService:
                     for slot_start, slot_end in suggestions
                 ]
                 pending = {
+                    "mode": "create",
                     "title": parsed.get("title") or "Новое событие",
                     "description": parsed.get("description") or text,
                     "options": options,
@@ -951,6 +1214,12 @@ class TelegramBotService:
                 await message.answer(reply, reply_markup=self._suggestion_keyboard(pending))
                 await self._remember(message.from_user.id, "assistant", reply, session)
                 logger.info("conflict_detected user=%s requested=%s suggestions=%s", message.from_user.id, start_at.isoformat(), len(options))
+                await self._log_usage(
+                    session,
+                    message.from_user.id,
+                    "conflict_detected",
+                    {"requested": start_at.isoformat(), "count": len(options)},
+                )
                 return
             reply = "В это время уже есть событие, и рядом я не нашел нормального свободного окна. Подскажи другое время."
             await message.answer(reply)
@@ -962,6 +1231,7 @@ class TelegramBotService:
         await self._set_pending_confirmation(
             message.from_user.id,
             {
+                "mode": "create",
                 "title": title,
                 "description": description,
                 "start_iso": start_at.isoformat(),
@@ -978,6 +1248,187 @@ class TelegramBotService:
         )
         await message.answer(reply, reply_markup=self._confirm_keyboard())
         await self._remember(message.from_user.id, "assistant", f"Предложил создать {title} на {self._format_dt(start_at)}.", session)
+
+    async def _process_update_request(
+        self,
+        *,
+        message: Message,
+        text: str,
+        refresh_token: str,
+        access_token: str | None,
+        session: AsyncSession,
+    ) -> None:
+        parsed = await self.parser.parse_update_request(text)
+        if parsed.get("needs_clarification"):
+            reply = parsed.get("clarification_question") or "Уточни, что именно хочешь перенести или изменить."
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
+            return
+        if not parsed.get("should_update"):
+            await self._friendly_fallback(message, text, session)
+            return
+
+        timezone = parsed.get("timezone") or self.settings.default_timezone
+        search_from = self._ensure_tz(datetime.fromisoformat(parsed["search_from_iso"]))
+        search_to = self._ensure_tz(datetime.fromisoformat(parsed["search_to_iso"]))
+        title_query = (parsed.get("title_query") or "").strip().lower()
+
+        events = await self.calendar_service.list_events(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            time_min=search_from,
+            time_max=search_to,
+            timezone=timezone,
+            limit=30,
+        )
+        matches = []
+        for event in events:
+            summary = (event.get("summary") or "").lower()
+            if not title_query or title_query in summary:
+                matches.append(event)
+
+        if not matches:
+            reply = "Не нашел подходящее событие для переноса. Назови его чуть точнее."
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
+            return
+
+        if len(matches) > 1:
+            options = []
+            for event in matches[:5]:
+                start = self.calendar_service.parse_event_datetime(event, timezone, "start")
+                options.append(
+                    {
+                        "event_id": event["id"],
+                        "title": event.get("summary") or "Без названия",
+                        "current_description": event.get("description") or "",
+                        "current_start_iso": start.isoformat() if start else "",
+                        "current_end_iso": (
+                            self.calendar_service.parse_event_datetime(event, timezone, "end").isoformat()
+                            if self.calendar_service.parse_event_datetime(event, timezone, "end")
+                            else ""
+                        ),
+                        "label": f"{start.strftime('%d.%m %H:%M') if start else 'весь день'} — {escape(event.get('summary') or 'Без названия')}",
+                    }
+                )
+            await self._set_selection_state(
+                message.from_user.id,
+                {
+                    "mode": "update",
+                    "timezone": timezone,
+                    "new_title": parsed.get("new_title") or "",
+                    "new_description": parsed.get("new_description") or "",
+                    "new_start_iso": parsed.get("new_start_iso") or "",
+                    "new_end_iso": parsed.get("new_end_iso") or "",
+                    "options": options,
+                },
+                session,
+            )
+            reply = "Нашел несколько похожих событий для переноса. Выбери нужное кнопкой ниже."
+            await message.answer(reply, reply_markup=self._selection_keyboard(options))
+            await self._remember(message.from_user.id, "assistant", reply, session)
+            return
+
+        target = matches[0]
+        current_title = target.get("summary") or "Событие без названия"
+        current_description = target.get("description") or ""
+        current_start = self.calendar_service.parse_event_datetime(target, timezone, "start")
+        current_end = self.calendar_service.parse_event_datetime(target, timezone, "end")
+        if not current_start or not current_end:
+            reply = "Это событие выглядит нестандартно, я пока не умею его безопасно переносить."
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
+            return
+
+        new_title = parsed.get("new_title") or current_title
+        new_description = parsed.get("new_description") or current_description
+        new_start_iso = parsed.get("new_start_iso") or current_start.isoformat()
+        new_end_iso = parsed.get("new_end_iso") or current_end.isoformat()
+        new_start = self._ensure_tz(datetime.fromisoformat(new_start_iso))
+        new_end = self._ensure_tz(datetime.fromisoformat(new_end_iso))
+
+        conflicts = await self.calendar_service.find_conflicts(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            start_at=new_start,
+            end_at=new_end,
+            timezone=timezone,
+        )
+        conflicts = [event for event in conflicts if event.get("id") != target.get("id")]
+        if conflicts:
+            conflict = conflicts[0]
+            conflict_start = self.calendar_service.parse_event_datetime(conflict, timezone, "start")
+            conflict_title = escape(conflict.get("summary") or "другая встреча")
+            suggestions = await self.calendar_service.suggest_free_slots(
+                access_token=access_token,
+                refresh_token=refresh_token,
+                desired_start=new_start,
+                desired_end=new_end,
+                timezone=timezone,
+                count=12,
+            )
+            if suggestions:
+                options = [
+                    {
+                        "label": self._format_dt(slot_start),
+                        "start_iso": slot_start.isoformat(),
+                        "end_iso": slot_end.isoformat(),
+                    }
+                    for slot_start, slot_end in suggestions
+                ]
+                pending = {
+                    "mode": "update",
+                    "event_id": target["id"],
+                    "title": new_title,
+                    "description": new_description,
+                    "options": options,
+                    "offset": 0,
+                }
+                await self._set_pending_suggestions(message.from_user.id, pending, session)
+                visible = self._current_suggestion_options(pending)
+                time_text = conflict_start.strftime("%H:%M") if conflict_start else "это время"
+                tail = f" Еще рядом есть {visible[1]['label']}." if len(visible) > 1 else ""
+                reply = (
+                    f"Хотел перенести «{escape(current_title)}», но в {time_text} уже стоит «{conflict_title}».\n"
+                    f"Могу вместо этого перенести на {visible[0]['label']}.{tail}\n"
+                    "Выбирай вариант кнопкой ниже."
+                )
+                await message.answer(reply, reply_markup=self._suggestion_keyboard(pending))
+                await self._remember(message.from_user.id, "assistant", reply, session)
+                logger.info("update_conflict_detected user=%s event=%r requested=%s", message.from_user.id, current_title, new_start.isoformat())
+                await self._log_usage(
+                    session,
+                    message.from_user.id,
+                    "update_conflict_detected",
+                    {"title": current_title, "requested": new_start.isoformat()},
+                )
+                return
+
+            reply = "Нашел само событие, но в новое время уже есть пересечение. Подскажи другой слот."
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
+            return
+
+        await self._set_pending_confirmation(
+            message.from_user.id,
+            {
+                "mode": "update",
+                "event_id": target["id"],
+                "title": new_title,
+                "description": new_description,
+                "start_iso": new_start.isoformat(),
+                "end_iso": new_end.isoformat(),
+                "timezone": timezone,
+            },
+            session,
+        )
+        reply = (
+            f"Понял так, обновляем «{escape(current_title)}»:\n"
+            f"{self._describe_pending({'title': new_title, 'start_iso': new_start.isoformat(), 'end_iso': new_end.isoformat()})}\n\n"
+            "Если все так, жми кнопку ниже."
+        )
+        await message.answer(reply, reply_markup=self._confirm_keyboard())
+        await self._remember(message.from_user.id, "assistant", f"Предложил обновить {current_title} на {self._format_dt(new_start)}.", session)
 
     async def _process_cancel_request(
         self,
@@ -1028,13 +1479,23 @@ class TelegramBotService:
             options = []
             for event in matches[:5]:
                 start = self.calendar_service.parse_event_datetime(event, timezone, "start")
-                options.append(f"{start.strftime('%d.%m %H:%M') if start else 'весь день'} — {escape(event.get('summary') or 'Без названия')}")
-            reply = (
-                "Нашел несколько похожих событий:\n"
-                + "\n".join(f"• {item}" for item in options)
-                + "\n\nНапиши точнее, какое удалить."
+                options.append(
+                    {
+                        "event_id": event["id"],
+                        "title": event.get("summary") or "Без названия",
+                        "label": f"{start.strftime('%d.%m %H:%M') if start else 'весь день'} — {escape(event.get('summary') or 'Без названия')}",
+                    }
+                )
+            await self._set_selection_state(
+                message.from_user.id,
+                {
+                    "mode": "cancel",
+                    "options": options,
+                },
+                session,
             )
-            await message.answer(reply)
+            reply = "Нашел несколько похожих событий. Выбери, что именно удалить."
+            await message.answer(reply, reply_markup=self._selection_keyboard(options))
             await self._remember(message.from_user.id, "assistant", reply, session)
             return
 

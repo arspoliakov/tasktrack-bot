@@ -113,6 +113,36 @@ class GoogleCalendarService:
 
         await asyncio.to_thread(_delete)
 
+    async def update_event(
+        self,
+        *,
+        access_token: str | None,
+        refresh_token: str,
+        event_id: str,
+        title: str | None = None,
+        description: str | None = None,
+        start_iso: str | None = None,
+        end_iso: str | None = None,
+        timezone: str | None = None,
+    ) -> str:
+        credentials = self._build_credentials(access_token, refresh_token)
+
+        def _update() -> str:
+            service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
+            event = service.events().get(calendarId="primary", eventId=event_id).execute()
+            if title is not None:
+                event["summary"] = title
+            if description is not None:
+                event["description"] = description
+            if start_iso and timezone is not None:
+                event["start"] = {"dateTime": start_iso, "timeZone": timezone}
+            if end_iso and timezone is not None:
+                event["end"] = {"dateTime": end_iso, "timeZone": timezone}
+            updated = service.events().update(calendarId="primary", eventId=event_id, body=event).execute()
+            return updated.get("htmlLink", "")
+
+        return await asyncio.to_thread(_update)
+
     async def list_events(
         self,
         *,
