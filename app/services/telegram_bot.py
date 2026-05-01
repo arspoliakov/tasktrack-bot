@@ -18,7 +18,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
-from app.models import ConversationState, EventReminder, GoogleAccount, SelectionState, UsageEvent, User, UserStatus
+from app.models import ConversationState, EventReminder, GoogleAccount, SelectionState, UndoAction, UsageEvent, User, UserPreference, UserStatus
 from app.security import StateSigner
 from app.services.deepinfra import DeepInfraClient
 from app.services.google_calendar import GoogleCalendarService
@@ -56,6 +56,7 @@ class TelegramBotService:
         self.dispatcher.message.register(self.cmd_start, Command("start"))
         self.dispatcher.message.register(self.cmd_help, Command("help"))
         self.dispatcher.message.register(self.cmd_commands, Command("commands"))
+        self.dispatcher.message.register(self.cmd_undo, Command("undo"))
         self.dispatcher.message.register(self.cmd_approve, Command("approve"))
         self.dispatcher.message.register(self.cmd_block, Command("block"))
         self.dispatcher.message.register(self.cmd_pending, Command("pending"))
@@ -175,6 +176,18 @@ class TelegramBotService:
             "ясно",
         )
         return any(item in cleaned for item in reactions)
+
+    @staticmethod
+    def _is_undo_request(text: str) -> bool:
+        cleaned = text.strip().lower()
+        return cleaned in {
+            "undo",
+            "отмени последнее действие",
+            "откати последнее действие",
+            "верни последнее действие",
+            "отмени последнее",
+            "откати назад",
+        }
 
     @staticmethod
     def _loads_json(payload: str | None, default: Any) -> Any:
@@ -307,6 +320,31 @@ class TelegramBotService:
         )
         await session.commit()
 
+    async def _record_undo_action(
+        self,
+        session: AsyncSession,
+        telegram_id: int,
+        kind: str,
+        payload: dict[str, Any],
+    ) -> None:
+        session.add(
+            UndoAction(
+                telegram_id=telegram_id,
+                kind=kind,
+                payload_json=self._dumps_json(payload) or "{}",
+            )
+        )
+        await session.commit()
+
+    async def _get_last_undo_action(self, session: AsyncSession, telegram_id: int) -> UndoAction | None:
+        result = await session.execute(
+            select(UndoAction)
+            .where(UndoAction.telegram_id == telegram_id, UndoAction.undone_at.is_(None))
+            .order_by(UndoAction.created_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
     async def _schedule_event_reminder(
         self,
         *,
@@ -373,6 +411,72 @@ class TelegramBotService:
         if "night" in parts:
             return 20, 23
         return 9, 23
+
+    def _batch_result_lines(
+        self,
+        created: list[dict[str, Any]],
+        skipped: list[str],
+    ) -> list[str]:
+        lines: list[str] = []
+        if created:
+            lines.append("Готово, уже создал вот это:")
+            lines.extend(f"• <a href=\"{item['link']}\">{escape(item['title'])}</a>" for item in created)
+        if skipped:
+            if lines:
+                lines.append("")
+            lines.append("Это пока пропустил:")
+            lines.extend(f"• {item}" for item in skipped)
+        return lines
+
+    def _planner_alternatives_text(self, alternatives_by_day: list[tuple[str, list[str]]]) -> str:
+        if not alternatives_by_day:
+            return ""
+        lines = ["Ещё рядом нашёл такие варианты:"]
+        for day_label, options in alternatives_by_day[:3]:
+            if not options:
+                continue
+            lines.append(f"• {day_label}: " + ", ".join(options[:3]))
+        return "\n".join(lines)
+
+    async def _continue_batch_suggestion_flow(
+        self,
+        *,
+        session: AsyncSession,
+        telegram_id: int,
+        pending: dict[str, Any],
+        created_entry: dict[str, Any] | None = None,
+        skipped_current: bool = False,
+    ) -> dict[str, Any]:
+        created = list(pending.get("batch_created", []))
+        skipped = list(pending.get("batch_skipped", []))
+        if created_entry:
+            created.append(created_entry)
+        if skipped_current:
+            skipped.append(f"{pending['title']} — {self._format_dt(self._ensure_tz(datetime.fromisoformat(pending['requested_start_iso'])))}")
+
+        queue = list(pending.get("batch_queue", []))
+        if queue:
+            next_pending = queue[0]
+            next_pending["batch_queue"] = queue[1:]
+            next_pending["batch_created"] = created
+            next_pending["batch_skipped"] = skipped
+            await self._set_pending_suggestions(telegram_id, next_pending, session)
+            created_lines = self._batch_result_lines(created, skipped)
+            prefix = "\n".join(created_lines)
+            if prefix:
+                prefix += "\n\n"
+            conflict_dt = self._format_dt(self._ensure_tz(datetime.fromisoformat(next_pending["requested_start_iso"])))
+            visible = self._current_suggestion_options(next_pending)
+            tail = f" Еще рядом есть {visible[1]['label']}." if len(visible) > 1 else ""
+            reply = (
+                f"{prefix}Теперь по «{escape(next_pending['title'])}» есть конфликт на {conflict_dt}.\n"
+                f"Могу поставить на {visible[0]['label']}.{tail}\n"
+                "Выбирай вариант кнопкой ниже."
+            )
+            return {"done": False, "reply": reply, "pending": next_pending}
+
+        await self._set_pending_suggestions(telegram_id, None, session)
+        return {"done": True, "reply": "\n".join(self._batch_result_lines(created, skipped)), "created": created, "skipped": skipped}
 
     def _current_suggestion_options(self, pending: dict[str, Any]) -> list[dict[str, Any]]:
         options = pending.get("options", [])
@@ -500,11 +604,72 @@ class TelegramBotService:
             return f"весь день — {title}"
         return f"{start.strftime('%d.%m %H:%M')} — {title}"
 
+    @staticmethod
+    def _event_recreate_payload(event: dict[str, Any]) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        for key in ("summary", "description", "start", "end", "recurrence", "location"):
+            if event.get(key) is not None:
+                payload[key] = event[key]
+        return payload
+
+    async def _offer_recurring_cancel_scope(
+        self,
+        *,
+        telegram_id: int,
+        event: dict[str, Any],
+        timezone: str,
+        session: AsyncSession,
+    ) -> bool:
+        recurring_event_id = event.get("recurringEventId")
+        if not recurring_event_id:
+            return False
+
+        start = self.calendar_service.parse_event_datetime(event, timezone, "start")
+        title = event.get("summary") or "Без названия"
+        label = self._event_option_label(title, start)
+        options = [
+            {
+                "scope": "single",
+                "event_id": event["id"],
+                "title": title,
+                "recurring_event_id": recurring_event_id,
+                "instance_start_iso": start.isoformat() if start else "",
+                "label": f"Только этот — {label}",
+            },
+            {
+                "scope": "future",
+                "event_id": event["id"],
+                "title": title,
+                "recurring_event_id": recurring_event_id,
+                "instance_start_iso": start.isoformat() if start else "",
+                "label": f"Этот и все следующие — {label}",
+            },
+            {
+                "scope": "series",
+                "event_id": recurring_event_id,
+                "title": title,
+                "recurring_event_id": recurring_event_id,
+                "instance_start_iso": start.isoformat() if start else "",
+                "label": f"Всю серию — {title}",
+            },
+        ]
+        await self._set_selection_state(
+            telegram_id,
+            {
+                "mode": "cancel_scope",
+                "timezone": timezone,
+                "options": options,
+            },
+            session,
+        )
+        return True
+
     def _user_help_text(self) -> str:
         return (
             "Вот что я умею:\n"
             "/start — показать стартовое сообщение\n"
             "/help — показать все команды и примеры\n\n"
+            "/undo — откатить последнее действие\n\n"
             "Что можно писать обычным текстом или голосом:\n"
             "• создать событие: «созвон завтра в 15:00 на час»\n"
             "• перенести событие: «перенеси созвон с Колей на 16:00»\n"
@@ -522,7 +687,8 @@ class TelegramBotService:
             "/block &lt;telegram_id&gt; — заблокировать пользователя\n"
             "/pending — список ожидающих доступа\n"
             "/users — последние пользователи\n"
-            "/stats — короткая статистика по использованию"
+            "/stats — короткая статистика по использованию\n"
+            "/undo — откатить последнее действие"
         )
 
     async def _get_or_create_user(self, message: Message, session: AsyncSession) -> User:
@@ -555,6 +721,27 @@ class TelegramBotService:
 
     async def _get_google_account(self, user_id: int, session: AsyncSession) -> GoogleAccount:
         return (await session.execute(select(GoogleAccount).where(GoogleAccount.user_id == user_id))).scalar_one()
+
+    async def _get_user_preferences(self, user_id: int, session: AsyncSession) -> UserPreference:
+        result = await session.execute(select(UserPreference).where(UserPreference.user_id == user_id))
+        preferences = result.scalar_one_or_none()
+        if preferences:
+            return preferences
+
+        preferences = UserPreference(user_id=user_id)
+        session.add(preferences)
+        await session.flush()
+        return preferences
+
+    async def _remember_reminder_preference(self, user_id: int, minutes_before: int, session: AsyncSession) -> None:
+        preferences = await self._get_user_preferences(user_id, session)
+        preferences.default_reminder_minutes = minutes_before
+        await session.commit()
+
+    async def _remember_overlap_preference(self, user_id: int, session: AsyncSession) -> None:
+        preferences = await self._get_user_preferences(user_id, session)
+        preferences.prefers_overlap = True
+        await session.commit()
 
     def _connect_url(self, telegram_id: int) -> str:
         state = self.signer.dumps({"telegram_id": telegram_id})
@@ -722,22 +909,75 @@ class TelegramBotService:
         visible = self._current_suggestion_options(pending)
         if self._is_yes(text) and visible:
             option = visible[0]
-            link = await self._create_calendar_entry(
+            created_event = await self.calendar_service.create_event_details(
                 access_token=access_token,
                 refresh_token=refresh_token,
                 title=pending["title"],
                 description=pending["description"],
                 start_iso=option["start_iso"],
                 end_iso=option["end_iso"],
-                timezone=self.settings.default_timezone,
+                timezone=pending.get("timezone") or self.settings.default_timezone,
             )
+            created_entry = {"title": pending["title"], "link": created_event.get("htmlLink", ""), "event_id": created_event.get("id")}
+            if pending.get("batch_queue") is not None:
+                state = await self._continue_batch_suggestion_flow(
+                    session=session,
+                    telegram_id=message.from_user.id,
+                    pending=pending,
+                    created_entry=created_entry,
+                )
+                if state["done"]:
+                    reply = state["reply"] or "Готово."
+                    await message.answer(reply)
+                    if state.get("created"):
+                        await self._record_undo_action(
+                            session,
+                            message.from_user.id,
+                            "create_batch",
+                            {"event_ids": [item["event_id"] for item in state["created"] if item.get("event_id")]},
+                        )
+                else:
+                    reply = state["reply"]
+                    await message.answer(reply, reply_markup=self._suggestion_keyboard(state["pending"]))
+                await self._remember(message.from_user.id, "assistant", reply, session)
+                return True
+
             await self._set_pending_suggestions(message.from_user.id, None, session)
-            reply = f"Супер, поставил на {option['label']}.\n<a href=\"{link}\">Открыть событие в Google Calendar</a>"
+            await self._record_undo_action(
+                session,
+                message.from_user.id,
+                "create_event",
+                {"event_id": created_event.get("id"), "event_title": pending["title"]},
+            )
+            reply = f"Супер, поставил на {option['label']}.\n<a href=\"{created_event.get('htmlLink', '')}\">Открыть событие в Google Calendar</a>"
             await message.answer(reply)
             await self._remember(message.from_user.id, "assistant", f"Поставил событие на {option['label']}.", session)
             return True
 
         if self._is_no(text):
+            if pending.get("batch_queue") is not None:
+                state = await self._continue_batch_suggestion_flow(
+                    session=session,
+                    telegram_id=message.from_user.id,
+                    pending=pending,
+                    skipped_current=True,
+                )
+                if state["done"]:
+                    reply = state["reply"] or "Окей, пропустил конфликтные пункты."
+                    await message.answer(reply)
+                    if state.get("created"):
+                        await self._record_undo_action(
+                            session,
+                            message.from_user.id,
+                            "create_batch",
+                            {"event_ids": [item["event_id"] for item in state["created"] if item.get("event_id")]},
+                        )
+                else:
+                    reply = state["reply"]
+                    await message.answer(reply, reply_markup=self._suggestion_keyboard(state["pending"]))
+                await self._remember(message.from_user.id, "assistant", reply, session)
+                return True
+
             await self._set_pending_suggestions(message.from_user.id, None, session)
             reply = "Окей, не создаю. Напиши другое время, и я попробую еще раз."
             await message.answer(reply)
@@ -774,8 +1014,9 @@ class TelegramBotService:
 
         mode = pending.get("mode", "create")
         if mode == "create_batch":
-            created: list[tuple[str, str]] = []
+            created: list[dict[str, Any]] = []
             skipped: list[str] = []
+            unresolved: list[dict[str, Any]] = []
             for item in pending.get("items", []):
                 item_timezone = item.get("timezone") or self.settings.default_timezone
                 start_at = self._ensure_tz(datetime.fromisoformat(item["start_iso"]))
@@ -788,10 +1029,39 @@ class TelegramBotService:
                     timezone=item_timezone,
                 )
                 if conflicts:
-                    skipped.append(f"• {escape(item['title'])} — {self._format_dt(start_at)}")
+                    suggestions = await self.calendar_service.suggest_free_slots(
+                        access_token=access_token,
+                        refresh_token=refresh_token,
+                        desired_start=start_at,
+                        desired_end=end_at,
+                        timezone=item_timezone,
+                        count=12,
+                    )
+                    if suggestions:
+                        unresolved.append(
+                            {
+                                "mode": "create",
+                                "title": item["title"],
+                                "description": item["description"],
+                                "requested_start_iso": item["start_iso"],
+                                "requested_end_iso": item["end_iso"],
+                                "timezone": item_timezone,
+                                "options": [
+                                    {
+                                        "label": self._format_dt(slot_start),
+                                        "start_iso": slot_start.isoformat(),
+                                        "end_iso": slot_end.isoformat(),
+                                    }
+                                    for slot_start, slot_end in suggestions
+                                ],
+                                "offset": 0,
+                            }
+                        )
+                    else:
+                        skipped.append(f"{item['title']} — {self._format_dt(start_at)}")
                     continue
 
-                link = await self._create_calendar_entry(
+                created_event = await self.calendar_service.create_event_details(
                     access_token=access_token,
                     refresh_token=refresh_token,
                     title=item["title"],
@@ -800,21 +1070,30 @@ class TelegramBotService:
                     end_iso=item["end_iso"],
                     timezone=item_timezone,
                 )
-                created.append((item["title"], link))
+                created.append({"title": item["title"], "link": created_event.get("htmlLink", ""), "event_id": created_event.get("id")})
 
             await self._set_pending_confirmation(message.from_user.id, None, session)
-            lines: list[str] = []
-            if created:
-                lines.append("Готово, создал вот это:")
-                lines.extend(f"• <a href=\"{link}\">{escape(title)}</a>" for title, link in created)
-            if skipped:
-                lines.append("")
-                lines.append("Эти события пока пропустил, потому что их слот уже занят:")
-                lines.extend(skipped)
-            if not created and skipped:
-                lines.append("")
-                lines.append("Если хочешь, можем отдельно подобрать для них свободное время.")
-            reply = "\n".join(lines) if lines else "Похоже, тут пока нечего создавать."
+            if unresolved:
+                first = unresolved[0]
+                first["batch_queue"] = unresolved[1:]
+                first["batch_created"] = created
+                first["batch_skipped"] = skipped
+                await self._set_pending_suggestions(message.from_user.id, first, session)
+                lines = self._batch_result_lines(created, skipped)
+                prefix = "\n".join(lines)
+                if prefix:
+                    prefix += "\n\n"
+                visible = self._current_suggestion_options(first)
+                reply = (
+                    f"{prefix}Теперь по «{escape(first['title'])}» есть конфликт на {self._format_dt(self._ensure_tz(datetime.fromisoformat(first['requested_start_iso'])))}.\n"
+                    f"Могу поставить на {visible[0]['label']}.\n"
+                    "Выбирай вариант кнопкой ниже."
+                )
+                await message.answer(reply, reply_markup=self._suggestion_keyboard(first))
+                await self._remember(message.from_user.id, "assistant", reply, session)
+                return True
+
+            reply = "\n".join(self._batch_result_lines(created, skipped)) if (created or skipped) else "Похоже, тут пока нечего создавать."
             await message.answer(reply)
             await self._remember(
                 message.from_user.id,
@@ -828,9 +1107,21 @@ class TelegramBotService:
                 "event_batch_processed",
                 {"created": len(created), "skipped": len(skipped)},
             )
+            if created:
+                await self._record_undo_action(
+                    session,
+                    message.from_user.id,
+                    "create_batch",
+                    {"event_ids": [item["event_id"] for item in created if item.get("event_id")]},
+                )
             return True
 
         if mode == "update":
+            previous = await self.calendar_service.get_event(
+                access_token=access_token,
+                refresh_token=refresh_token,
+                event_id=pending["event_id"],
+            )
             link = await self.calendar_service.update_event(
                 access_token=access_token,
                 refresh_token=refresh_token,
@@ -840,6 +1131,12 @@ class TelegramBotService:
                 start_iso=pending.get("start_iso"),
                 end_iso=pending.get("end_iso"),
                 timezone=pending["timezone"],
+            )
+            await self._record_undo_action(
+                session,
+                message.from_user.id,
+                "update_event",
+                {"event_id": pending["event_id"], "previous_event": previous},
             )
             await self._set_pending_confirmation(message.from_user.id, None, session)
             reply = f"Готово, обновил событие.\n<a href=\"{link}\">Открыть в Google Calendar</a>"
@@ -853,8 +1150,56 @@ class TelegramBotService:
             )
             return True
 
+        if mode == "update_recurring_series":
+            previous = await self.calendar_service.get_event(
+                access_token=access_token,
+                refresh_token=refresh_token,
+                event_id=pending["event_id"],
+            )
+            updated = await self.calendar_service.update_recurring_series(
+                access_token=access_token,
+                refresh_token=refresh_token,
+                recurring_event_id=pending["event_id"],
+                title=pending.get("title"),
+                description=pending.get("description"),
+                start_iso=pending.get("start_iso"),
+                end_iso=pending.get("end_iso"),
+                timezone=pending["timezone"],
+            )
+            await self._record_undo_action(
+                session,
+                message.from_user.id,
+                "update_event",
+                {"event_id": pending["event_id"], "previous_event": previous},
+            )
+            await self._set_pending_confirmation(message.from_user.id, None, session)
+            reply = f"Готово, обновил всю серию.\n<a href=\"{updated.get('htmlLink', '')}\">Открыть в Google Calendar</a>"
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", f"Обновил всю серию {pending['title']}.", session)
+            await self._log_usage(session, message.from_user.id, "event_updated_recurring_series", {"title": pending["title"]})
+            return True
+
+        if mode == "update_future_recurring":
+            created = await self.calendar_service.split_and_update_recurring_series(
+                access_token=access_token,
+                refresh_token=refresh_token,
+                recurring_event_id=pending["recurring_event_id"],
+                split_from=self._ensure_tz(datetime.fromisoformat(pending["instance_start_iso"])),
+                title=pending["title"],
+                description=pending["description"],
+                start_iso=pending["start_iso"],
+                end_iso=pending["end_iso"],
+                timezone=pending["timezone"],
+            )
+            await self._set_pending_confirmation(message.from_user.id, None, session)
+            reply = f"Готово, обновил этот и все следующие повторы.\n<a href=\"{created.get('htmlLink', '')}\">Открыть в Google Calendar</a>"
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", f"Обновил будущие повторы {pending['title']}.", session)
+            await self._log_usage(session, message.from_user.id, "event_updated_recurring_future", {"title": pending["title"]})
+            return True
+
         if mode == "create_recurring":
-            link = await self.calendar_service.create_recurring_event(
+            created = await self.calendar_service.create_recurring_event_details(
                 access_token=access_token,
                 refresh_token=refresh_token,
                 title=pending["title"],
@@ -863,6 +1208,13 @@ class TelegramBotService:
                 end_iso=pending["end_iso"],
                 timezone=pending["timezone"],
                 recurrence_rule=pending["recurrence_rule"],
+            )
+            link = created.get("htmlLink", "")
+            await self._record_undo_action(
+                session,
+                message.from_user.id,
+                "create_event",
+                {"event_id": created.get("id"), "event_title": pending["title"]},
             )
             await self._set_pending_confirmation(message.from_user.id, None, session)
             reply = f"Готово, создал повторяющееся событие.\n<a href=\"{link}\">Открыть в Google Calendar</a>"
@@ -876,7 +1228,7 @@ class TelegramBotService:
             )
             return True
 
-        link = await self._create_calendar_entry(
+        created = await self.calendar_service.create_event_details(
             access_token=access_token,
             refresh_token=refresh_token,
             title=pending["title"],
@@ -884,6 +1236,13 @@ class TelegramBotService:
             start_iso=pending["start_iso"],
             end_iso=pending["end_iso"],
             timezone=pending["timezone"],
+        )
+        link = created.get("htmlLink", "")
+        await self._record_undo_action(
+            session,
+            message.from_user.id,
+            "create_event",
+            {"event_id": created.get("id"), "event_title": pending["title"]},
         )
         await self._set_pending_confirmation(message.from_user.id, None, session)
         reply = f"Готово, событие создал.\n<a href=\"{link}\">Открыть в Google Calendar</a>"
@@ -1191,6 +1550,7 @@ class TelegramBotService:
 
         items: list[dict[str, Any]] = []
         unavailable: list[str] = []
+        alternatives_by_day: list[tuple[str, list[str]]] = []
         for date_iso in dates[:count]:
             day = datetime.fromisoformat(date_iso).replace(tzinfo=self._tz())
             if earliest_time:
@@ -1206,18 +1566,19 @@ class TelegramBotService:
             if window_end <= window_start:
                 window_end = window_start + timedelta(hours=4)
 
-            slot = await self.calendar_service.find_first_free_slot_in_window(
+            slots = await self.calendar_service.find_free_slots_in_window(
                 access_token=access_token,
                 refresh_token=refresh_token,
                 window_start=window_start,
                 window_end=window_end,
                 duration_minutes=duration_minutes,
                 timezone=timezone,
+                count=3,
             )
-            if not slot:
+            if not slots:
                 unavailable.append(day.strftime("%d.%m"))
                 continue
-            slot_start, slot_end = slot
+            slot_start, slot_end = slots[0]
             items.append(
                 {
                     "title": title,
@@ -1227,6 +1588,13 @@ class TelegramBotService:
                     "timezone": timezone,
                 }
             )
+            if len(slots) > 1:
+                alternatives_by_day.append(
+                    (
+                        day.strftime("%d.%m"),
+                        [self._format_dt(candidate_start) for candidate_start, _ in slots[1:]],
+                    )
+                )
 
         if not items:
             reply = "Я не нашел нормальных свободных окон под это в указанные дни. Давай сузим время или выберем другие дни."
@@ -1242,6 +1610,9 @@ class TelegramBotService:
         reply = "Нашел такие слоты:\n" + self._describe_pending({"items": items})
         if unavailable:
             reply += "\n\nНе нашел окно в: " + ", ".join(unavailable)
+        planner_alternatives = self._planner_alternatives_text(alternatives_by_day)
+        if planner_alternatives:
+            reply += "\n\n" + planner_alternatives
         reply += "\n\nЕсли все ок, ответь «да» или жми кнопку."
         await message.answer(reply, reply_markup=self._confirm_keyboard())
         await self._remember(message.from_user.id, "assistant", reply, session)
@@ -1370,6 +1741,7 @@ class TelegramBotService:
             event_start_iso=start.isoformat(),
             minutes_before=minutes_before,
         )
+        await self._remember_reminder_preference(user.id, minutes_before, session)
         reply = f"Готово, напомню про «{escape(target.get('summary') or 'событие')}» за {minutes_before} мин."
         await message.answer(reply)
         await self._remember(message.from_user.id, "assistant", reply, session)
@@ -1424,6 +1796,84 @@ class TelegramBotService:
             reply = self._admin_help_text() if user and user.status == UserStatus.ADMIN.value else self._user_help_text()
             await message.answer(reply)
             await self._remember(message.from_user.id, "assistant", reply, session)
+
+    async def _perform_undo(self, message: Message, session: AsyncSession, user: User) -> bool:
+        google_account = await self._get_google_account(user.id, session)
+        action = await self._get_last_undo_action(session, message.from_user.id)
+        if not action:
+            reply = "Пока нечего откатывать."
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
+            return True
+
+        payload = self._loads_json(action.payload_json, {}) or {}
+        try:
+            if action.kind == "create_event":
+                event_id = payload.get("event_id")
+                if not event_id:
+                    raise ValueError("missing event_id")
+                await self.calendar_service.delete_event(
+                    access_token=google_account.access_token,
+                    refresh_token=google_account.refresh_token,
+                    event_id=event_id,
+                )
+                reply = "Откатил последнее создание события."
+            elif action.kind == "create_batch":
+                for event_id in payload.get("event_ids", []):
+                    await self.calendar_service.delete_event(
+                        access_token=google_account.access_token,
+                        refresh_token=google_account.refresh_token,
+                        event_id=event_id,
+                    )
+                reply = "Откатил последнее пакетное создание."
+            elif action.kind == "update_event":
+                previous_event = payload.get("previous_event") or {}
+                event_id = payload.get("event_id")
+                if not event_id or not previous_event:
+                    raise ValueError("missing previous_event")
+                await self.calendar_service.update_event(
+                    access_token=google_account.access_token,
+                    refresh_token=google_account.refresh_token,
+                    event_id=event_id,
+                    title=previous_event.get("summary"),
+                    description=previous_event.get("description"),
+                    start_iso=(previous_event.get("start") or {}).get("dateTime"),
+                    end_iso=(previous_event.get("end") or {}).get("dateTime"),
+                    timezone=(previous_event.get("start") or {}).get("timeZone") or self.settings.default_timezone,
+                )
+                reply = "Откатил последнее изменение события."
+            elif action.kind == "delete_event":
+                event_payload = payload.get("event_payload") or {}
+                created = await self.calendar_service.create_event_from_payload(
+                    access_token=google_account.access_token,
+                    refresh_token=google_account.refresh_token,
+                    payload=event_payload,
+                )
+                reply = f"Вернул удалённое событие.\n<a href=\"{created.get('htmlLink', '')}\">Открыть в Google Calendar</a>"
+            else:
+                reply = "Это действие я пока не умею безопасно откатывать."
+                await message.answer(reply)
+                await self._remember(message.from_user.id, "assistant", reply, session)
+                return True
+        except Exception:
+            logger.exception("undo_failed user=%s action=%s", message.from_user.id, action.kind)
+            reply = "Не смог откатить последнее действие. Лучше проверить календарь руками."
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
+            return True
+
+        action.undone_at = datetime.now(self._tz())
+        await session.commit()
+        await message.answer(reply)
+        await self._remember(message.from_user.id, "assistant", reply, session)
+        return True
+
+    async def cmd_undo(self, message: Message) -> None:
+        async with self.session_factory() as session:
+            user = await self._ensure_access(message, session)
+            if not user:
+                return
+            await self._perform_undo(message, session, user)
 
     async def cmd_approve(self, message: Message, command: CommandObject) -> None:
         if message.from_user.id != self.settings.admin_telegram_id:
@@ -1543,6 +1993,10 @@ class TelegramBotService:
                 return
             google_account = await self._get_google_account(user.id, session)
 
+            if self._is_undo_request(message.text or ""):
+                await self._perform_undo(message, session, user)
+                return
+
             if await self._handle_pending_suggestion(
                 message=message,
                 access_token=google_account.access_token,
@@ -1650,10 +2104,43 @@ class TelegramBotService:
                 await callback.message.edit_reply_markup(reply_markup=None)
 
                 if mode == "cancel":
+                    if option.get("recurring_event_id"):
+                        await self._offer_recurring_cancel_scope(
+                            telegram_id=user_id,
+                            event={
+                                "id": option["event_id"],
+                                "summary": option["title"],
+                                "recurringEventId": option.get("recurring_event_id"),
+                                "start": {"dateTime": option.get("instance_start_iso")},
+                            },
+                            timezone=selection.get("timezone") or self.settings.default_timezone,
+                            session=session,
+                        )
+                        reply = (
+                            f"«{escape(option['title'])}» похоже на повторяющееся событие.\n"
+                            "Выбери, что именно удалить: только этот день, этот и все следующие, или всю серию."
+                        )
+                        next_selection = await self._get_selection_state(user_id, session)
+                        await callback.message.answer(reply, reply_markup=self._selection_keyboard(next_selection["options"]))
+                        await self._remember(user_id, "assistant", reply, session)
+                        await callback.answer()
+                        return
+
+                    deleted_event = await self.calendar_service.get_event(
+                        access_token=google_account.access_token,
+                        refresh_token=google_account.refresh_token,
+                        event_id=option["event_id"],
+                    )
                     await self.calendar_service.delete_event(
                         access_token=google_account.access_token,
                         refresh_token=google_account.refresh_token,
                         event_id=option["event_id"],
+                    )
+                    await self._record_undo_action(
+                        session,
+                        user_id,
+                        "delete_event",
+                        {"event_payload": self._event_recreate_payload(deleted_event)},
                     )
                     reply = f"Готово, удалил «{escape(option['title'])}» из календаря."
                     await callback.message.answer(reply)
@@ -1664,6 +2151,125 @@ class TelegramBotService:
                         "event_deleted",
                         {"title": option["title"], "event_id": option["event_id"]},
                     )
+                    await callback.answer()
+                    return
+
+                if mode == "cancel_scope":
+                    scope = option.get("scope")
+                    title = option["title"]
+                    if scope == "single":
+                        deleted_event = await self.calendar_service.get_event(
+                            access_token=google_account.access_token,
+                            refresh_token=google_account.refresh_token,
+                            event_id=option["event_id"],
+                        )
+                        await self.calendar_service.delete_event(
+                            access_token=google_account.access_token,
+                            refresh_token=google_account.refresh_token,
+                            event_id=option["event_id"],
+                        )
+                        await self._record_undo_action(
+                            session,
+                            user_id,
+                            "delete_event",
+                            {"event_payload": self._event_recreate_payload(deleted_event)},
+                        )
+                        reply = f"Готово, убрал только этот повтор «{escape(title)}»."
+                        usage_kind = "event_deleted_single_recurring"
+                    elif scope == "future":
+                        instance_start = self._ensure_tz(datetime.fromisoformat(option["instance_start_iso"]))
+                        await self.calendar_service.truncate_recurring_series(
+                            access_token=google_account.access_token,
+                            refresh_token=google_account.refresh_token,
+                            recurring_event_id=option["recurring_event_id"],
+                            keep_until_before=instance_start - timedelta(seconds=1),
+                        )
+                        reply = f"Готово, убрал «{escape(title)}» начиная с этого дня и все следующие повторы."
+                        usage_kind = "event_deleted_future_recurring"
+                    else:
+                        deleted_series = await self.calendar_service.get_event(
+                            access_token=google_account.access_token,
+                            refresh_token=google_account.refresh_token,
+                            event_id=option["recurring_event_id"],
+                        )
+                        await self.calendar_service.delete_event(
+                            access_token=google_account.access_token,
+                            refresh_token=google_account.refresh_token,
+                            event_id=option["recurring_event_id"],
+                        )
+                        await self._record_undo_action(
+                            session,
+                            user_id,
+                            "delete_event",
+                            {"event_payload": self._event_recreate_payload(deleted_series)},
+                        )
+                        reply = f"Готово, удалил всю серию «{escape(title)}»."
+                        usage_kind = "event_deleted_series_recurring"
+
+                    await callback.message.answer(reply)
+                    await self._remember(user_id, "assistant", reply, session)
+                    await self._log_usage(
+                        session,
+                        user_id,
+                        usage_kind,
+                        {"title": title, "scope": scope},
+                    )
+                    await callback.answer()
+                    return
+
+                if mode == "update_scope":
+                    scope = option.get("scope")
+                    if scope == "single":
+                        pending = {
+                            "mode": "update",
+                            "event_id": option["event_id"],
+                            "title": selection["new_title"] or option["title"],
+                            "description": selection["new_description"] or "",
+                            "start_iso": selection["new_start_iso"],
+                            "end_iso": selection["new_end_iso"],
+                            "timezone": selection["timezone"],
+                        }
+                        reply = (
+                            f"Понял, обновляем только этот повтор «{escape(option['title'])}»:\n"
+                            f"{self._describe_pending(pending)}\n\n"
+                            "Если все так, жми кнопку ниже."
+                        )
+                    elif scope == "future":
+                        pending = {
+                            "mode": "update_future_recurring",
+                            "event_id": option["event_id"],
+                            "recurring_event_id": option["recurring_event_id"],
+                            "instance_start_iso": option["instance_start_iso"],
+                            "title": selection["new_title"] or option["title"],
+                            "description": selection["new_description"] or "",
+                            "start_iso": selection["new_start_iso"],
+                            "end_iso": selection["new_end_iso"],
+                            "timezone": selection["timezone"],
+                        }
+                        reply = (
+                            f"Понял, обновляем этот и все следующие повторы «{escape(option['title'])}»:\n"
+                            f"{self._describe_pending(pending)}\n\n"
+                            "Если все так, жми кнопку ниже."
+                        )
+                    else:
+                        pending = {
+                            "mode": "update_recurring_series",
+                            "event_id": option["recurring_event_id"],
+                            "title": selection["new_title"] or option["title"],
+                            "description": selection["new_description"] or "",
+                            "start_iso": selection["new_start_iso"],
+                            "end_iso": selection["new_end_iso"],
+                            "timezone": selection["timezone"],
+                        }
+                        reply = (
+                            f"Понял, обновляем всю серию «{escape(option['title'])}»:\n"
+                            f"{self._describe_pending(pending)}\n\n"
+                            "Если все так, жми кнопку ниже."
+                        )
+
+                    await self._set_pending_confirmation(user_id, pending, session)
+                    await callback.message.answer(reply, reply_markup=self._confirm_keyboard())
+                    await self._remember(user_id, "assistant", reply, session)
                     await callback.answer()
                     return
 
@@ -1698,6 +2304,7 @@ class TelegramBotService:
                         event_start_iso=option["event_start_iso"],
                         minutes_before=int(selection["minutes_before"]),
                     )
+                    await self._remember_reminder_preference(user.id, int(selection["minutes_before"]), session)
                     reply = f"Готово, напомню про «{escape(option['title'])}» за {selection['minutes_before']} мин."
                     await callback.message.answer(reply)
                     await self._remember(user_id, "assistant", reply, session)
@@ -1731,6 +2338,7 @@ class TelegramBotService:
                     event_start_iso=start.isoformat(),
                     minutes_before=minutes_before,
                 )
+                await self._remember_reminder_preference(user.id, minutes_before, session)
                 reply = f"Готово, напомню про «{escape(event.get('summary') or 'событие')}» за {minutes_before} мин."
                 await callback.answer("Напоминание поставил")
                 await callback.message.answer(reply)
@@ -1745,8 +2353,9 @@ class TelegramBotService:
                     return
                 mode = pending.get("mode", "create")
                 if mode == "create_batch":
-                    created: list[tuple[str, str]] = []
+                    created: list[dict[str, Any]] = []
                     skipped: list[str] = []
+                    unresolved: list[dict[str, Any]] = []
                     for item in pending.get("items", []):
                         item_timezone = item.get("timezone") or self.settings.default_timezone
                         start_at = self._ensure_tz(datetime.fromisoformat(item["start_iso"]))
@@ -1759,10 +2368,39 @@ class TelegramBotService:
                             timezone=item_timezone,
                         )
                         if conflicts:
-                            skipped.append(f"• {escape(item['title'])} — {self._format_dt(start_at)}")
+                            suggestions = await self.calendar_service.suggest_free_slots(
+                                access_token=google_account.access_token,
+                                refresh_token=google_account.refresh_token,
+                                desired_start=start_at,
+                                desired_end=end_at,
+                                timezone=item_timezone,
+                                count=12,
+                            )
+                            if suggestions:
+                                unresolved.append(
+                                    {
+                                        "mode": "create",
+                                        "title": item["title"],
+                                        "description": item["description"],
+                                        "requested_start_iso": item["start_iso"],
+                                        "requested_end_iso": item["end_iso"],
+                                        "timezone": item_timezone,
+                                        "options": [
+                                            {
+                                                "label": self._format_dt(slot_start),
+                                                "start_iso": slot_start.isoformat(),
+                                                "end_iso": slot_end.isoformat(),
+                                            }
+                                            for slot_start, slot_end in suggestions
+                                        ],
+                                        "offset": 0,
+                                    }
+                                )
+                            else:
+                                skipped.append(f"{item['title']} — {self._format_dt(start_at)}")
                             continue
 
-                        link = await self._create_calendar_entry(
+                        created_event = await self.calendar_service.create_event_details(
                             access_token=google_account.access_token,
                             refresh_token=google_account.refresh_token,
                             title=item["title"],
@@ -1771,22 +2409,32 @@ class TelegramBotService:
                             end_iso=item["end_iso"],
                             timezone=item_timezone,
                         )
-                        created.append((item["title"], link))
+                        created.append({"title": item["title"], "link": created_event.get("htmlLink", ""), "event_id": created_event.get("id")})
 
                     await self._set_pending_confirmation(user_id, None, session)
                     await callback.message.edit_reply_markup(reply_markup=None)
-                    lines: list[str] = []
-                    if created:
-                        lines.append("Готово, создал вот это:")
-                        lines.extend(f"• <a href=\"{link}\">{escape(title)}</a>" for title, link in created)
-                    if skipped:
-                        lines.append("")
-                        lines.append("Эти события пока пропустил, потому что их слот уже занят:")
-                        lines.extend(skipped)
-                    if not created and skipped:
-                        lines.append("")
-                        lines.append("Если хочешь, можем отдельно подобрать для них свободное время.")
-                    reply = "\n".join(lines) if lines else "Похоже, тут пока нечего создавать."
+                    if unresolved:
+                        first = unresolved[0]
+                        first["batch_queue"] = unresolved[1:]
+                        first["batch_created"] = created
+                        first["batch_skipped"] = skipped
+                        await self._set_pending_suggestions(user_id, first, session)
+                        lines = self._batch_result_lines(created, skipped)
+                        prefix = "\n".join(lines)
+                        if prefix:
+                            prefix += "\n\n"
+                        visible = self._current_suggestion_options(first)
+                        reply = (
+                            f"{prefix}Теперь по «{escape(first['title'])}» есть конфликт на {self._format_dt(self._ensure_tz(datetime.fromisoformat(first['requested_start_iso'])))}.\n"
+                            f"Могу поставить на {visible[0]['label']}.\n"
+                            "Выбирай вариант кнопкой ниже."
+                        )
+                        await callback.message.answer(reply, reply_markup=self._suggestion_keyboard(first))
+                        await self._remember(user_id, "assistant", reply, session)
+                        await callback.answer()
+                        return
+
+                    reply = "\n".join(self._batch_result_lines(created, skipped)) if (created or skipped) else "Похоже, тут пока нечего создавать."
                     await callback.message.answer(reply)
                     await self._remember(
                         user_id,
@@ -1800,10 +2448,17 @@ class TelegramBotService:
                         "event_batch_processed",
                         {"created": len(created), "skipped": len(skipped)},
                     )
+                    if created:
+                        await self._record_undo_action(
+                            session,
+                            user_id,
+                            "create_batch",
+                            {"event_ids": [item["event_id"] for item in created if item.get("event_id")]},
+                        )
                     await callback.answer()
                     return
                 if mode == "create_recurring":
-                    link = await self.calendar_service.create_recurring_event(
+                    created = await self.calendar_service.create_recurring_event_details(
                         access_token=google_account.access_token,
                         refresh_token=google_account.refresh_token,
                         title=pending["title"],
@@ -1812,6 +2467,13 @@ class TelegramBotService:
                         end_iso=pending["end_iso"],
                         timezone=pending["timezone"],
                         recurrence_rule=pending["recurrence_rule"],
+                    )
+                    link = created.get("htmlLink", "")
+                    await self._record_undo_action(
+                        session,
+                        user_id,
+                        "create_event",
+                        {"event_id": created.get("id"), "event_title": pending["title"]},
                     )
                     await self._set_pending_confirmation(user_id, None, session)
                     await callback.message.edit_reply_markup(reply_markup=None)
@@ -1827,6 +2489,11 @@ class TelegramBotService:
                     await callback.answer()
                     return
                 if mode == "update":
+                    previous = await self.calendar_service.get_event(
+                        access_token=google_account.access_token,
+                        refresh_token=google_account.refresh_token,
+                        event_id=pending["event_id"],
+                    )
                     link = await self.calendar_service.update_event(
                         access_token=google_account.access_token,
                         refresh_token=google_account.refresh_token,
@@ -1837,8 +2504,50 @@ class TelegramBotService:
                         end_iso=pending.get("end_iso"),
                         timezone=pending["timezone"],
                     )
+                    await self._record_undo_action(
+                        session,
+                        user_id,
+                        "update_event",
+                        {"event_id": pending["event_id"], "previous_event": previous},
+                    )
+                elif mode == "update_recurring_series":
+                    previous = await self.calendar_service.get_event(
+                        access_token=google_account.access_token,
+                        refresh_token=google_account.refresh_token,
+                        event_id=pending["event_id"],
+                    )
+                    updated = await self.calendar_service.update_recurring_series(
+                        access_token=google_account.access_token,
+                        refresh_token=google_account.refresh_token,
+                        recurring_event_id=pending["event_id"],
+                        title=pending.get("title"),
+                        description=pending.get("description"),
+                        start_iso=pending.get("start_iso"),
+                        end_iso=pending.get("end_iso"),
+                        timezone=pending["timezone"],
+                    )
+                    link = updated.get("htmlLink", "")
+                    await self._record_undo_action(
+                        session,
+                        user_id,
+                        "update_event",
+                        {"event_id": pending["event_id"], "previous_event": previous},
+                    )
+                elif mode == "update_future_recurring":
+                    created = await self.calendar_service.split_and_update_recurring_series(
+                        access_token=google_account.access_token,
+                        refresh_token=google_account.refresh_token,
+                        recurring_event_id=pending["recurring_event_id"],
+                        split_from=self._ensure_tz(datetime.fromisoformat(pending["instance_start_iso"])),
+                        title=pending["title"],
+                        description=pending["description"],
+                        start_iso=pending["start_iso"],
+                        end_iso=pending["end_iso"],
+                        timezone=pending["timezone"],
+                    )
+                    link = created.get("htmlLink", "")
                 else:
-                    link = await self._create_calendar_entry(
+                    created = await self.calendar_service.create_event_details(
                         access_token=google_account.access_token,
                         refresh_token=google_account.refresh_token,
                         title=pending["title"],
@@ -1847,22 +2556,29 @@ class TelegramBotService:
                         end_iso=pending["end_iso"],
                         timezone=pending["timezone"],
                     )
+                    link = created.get("htmlLink", "")
+                    await self._record_undo_action(
+                        session,
+                        user_id,
+                        "create_event",
+                        {"event_id": created.get("id"), "event_title": pending["title"]},
+                    )
                 await self._set_pending_confirmation(user_id, None, session)
                 await callback.message.edit_reply_markup(reply_markup=None)
                 reply = (
-                    f"Готово, событие {'обновил' if mode == 'update' else 'создал'}.\n"
+                    f"Готово, событие {'обновил' if mode in {'update', 'update_recurring_series', 'update_future_recurring'} else 'создал'}.\n"
                     f"<a href=\"{link}\">Открыть в Google Calendar</a>"
                 )
                 await callback.message.answer(reply)
                 await self._remember(
                     user_id,
                     "assistant",
-                    f"{'Обновил' if mode == 'update' else 'Создал'} событие {pending['title']}.",
+                    f"{'Обновил' if mode in {'update', 'update_recurring_series', 'update_future_recurring'} else 'Создал'} событие {pending['title']}.",
                     session,
                 )
                 logger.info(
                     "%s user=%s title=%r start=%s",
-                    "event_updated" if mode == "update" else "event_created",
+                    "event_updated" if mode in {'update', 'update_recurring_series', 'update_future_recurring'} else "event_created",
                     user_id,
                     pending["title"],
                     pending.get("start_iso"),
@@ -1870,7 +2586,7 @@ class TelegramBotService:
                 await self._log_usage(
                     session,
                     user_id,
-                    "event_updated" if mode == "update" else "event_created",
+                    "event_updated" if mode in {'update', 'update_recurring_series', 'update_future_recurring'} else "event_created",
                     {"title": pending["title"], "start_iso": pending.get("start_iso")},
                 )
                 await callback.answer()
@@ -1903,7 +2619,7 @@ class TelegramBotService:
                     reply = f"Ок, перенес поверх на {self._format_dt(self._ensure_tz(datetime.fromisoformat(requested_start_iso)))}.\n<a href=\"{link}\">Открыть событие в Google Calendar</a>"
                     usage_kind = "event_updated_overlap"
                 else:
-                    link = await self._create_calendar_entry(
+                    created = await self.calendar_service.create_event_details(
                         access_token=google_account.access_token,
                         refresh_token=google_account.refresh_token,
                         title=pending["title"],
@@ -1912,8 +2628,36 @@ class TelegramBotService:
                         end_iso=requested_end_iso,
                         timezone=timezone,
                     )
+                    link = created.get("htmlLink", "")
                     reply = f"Ок, поставил поверх на {self._format_dt(self._ensure_tz(datetime.fromisoformat(requested_start_iso)))}.\n<a href=\"{link}\">Открыть событие в Google Calendar</a>"
                     usage_kind = "event_created_overlap"
+
+                await self._remember_overlap_preference(user.id, session)
+
+                if mode != "update" and pending.get("batch_queue") is not None:
+                    await callback.message.edit_reply_markup(reply_markup=None)
+                    state = await self._continue_batch_suggestion_flow(
+                        session=session,
+                        telegram_id=user_id,
+                        pending=pending,
+                        created_entry={"title": pending["title"], "link": link, "event_id": created.get("id")},
+                    )
+                    if state["done"]:
+                        reply = state["reply"] or "Готово."
+                        await callback.message.answer(reply)
+                        if state.get("created"):
+                            await self._record_undo_action(
+                                session,
+                                user_id,
+                                "create_batch",
+                                {"event_ids": [item["event_id"] for item in state["created"] if item.get("event_id")]},
+                            )
+                    else:
+                        reply = state["reply"]
+                        await callback.message.answer(reply, reply_markup=self._suggestion_keyboard(state["pending"]))
+                    await self._remember(user_id, "assistant", reply, session)
+                    await callback.answer()
+                    return
 
                 await self._set_pending_suggestions(user_id, None, session)
                 await callback.message.edit_reply_markup(reply_markup=None)
@@ -1925,6 +2669,13 @@ class TelegramBotService:
                     usage_kind,
                     {"title": pending["title"], "start_iso": requested_start_iso},
                 )
+                if mode != "update":
+                    await self._record_undo_action(
+                        session,
+                        user_id,
+                        "create_event",
+                        {"event_id": created.get("id"), "event_title": pending["title"]},
+                    )
                 await callback.answer()
                 return
 
@@ -1975,10 +2726,10 @@ class TelegramBotService:
                         description=pending["description"],
                         start_iso=option["start_iso"],
                         end_iso=option["end_iso"],
-                        timezone=self.settings.default_timezone,
+                        timezone=pending.get("timezone") or self.settings.default_timezone,
                     )
                 else:
-                    link = await self._create_calendar_entry(
+                    created = await self.calendar_service.create_event_details(
                         access_token=google_account.access_token,
                         refresh_token=google_account.refresh_token,
                         title=pending["title"],
@@ -1987,6 +2738,32 @@ class TelegramBotService:
                         end_iso=option["end_iso"],
                         timezone=self.settings.default_timezone,
                     )
+                    link = created.get("htmlLink", "")
+                if mode != "update" and pending.get("batch_queue") is not None:
+                    await callback.message.edit_reply_markup(reply_markup=None)
+                    state = await self._continue_batch_suggestion_flow(
+                        session=session,
+                        telegram_id=user_id,
+                        pending=pending,
+                        created_entry={"title": pending["title"], "link": link, "event_id": created.get("id")},
+                    )
+                    if state["done"]:
+                        reply = state["reply"] or "Готово."
+                        await callback.message.answer(reply)
+                        if state.get("created"):
+                            await self._record_undo_action(
+                                session,
+                                user_id,
+                                "create_batch",
+                                {"event_ids": [item["event_id"] for item in state["created"] if item.get("event_id")]},
+                            )
+                    else:
+                        reply = state["reply"]
+                        await callback.message.answer(reply, reply_markup=self._suggestion_keyboard(state["pending"]))
+                    await self._remember(user_id, "assistant", reply, session)
+                    await callback.answer()
+                    return
+
                 await self._set_pending_suggestions(user_id, None, session)
                 await callback.message.edit_reply_markup(reply_markup=None)
                 verb = "перенес" if mode == "update" else "поставил"
@@ -2011,6 +2788,13 @@ class TelegramBotService:
                     "event_updated_from_suggestion" if mode == "update" else "event_created_from_suggestion",
                     {"title": pending["title"], "start_iso": option["start_iso"]},
                 )
+                if mode != "update":
+                    await self._record_undo_action(
+                        session,
+                        user_id,
+                        "create_event",
+                        {"event_id": created.get("id"), "event_title": pending["title"]},
+                    )
                 await callback.answer()
 
     async def _process_event_request(
@@ -2103,6 +2887,8 @@ class TelegramBotService:
             conflict = conflicts[0]
             conflict_start = self.calendar_service.parse_event_datetime(conflict, timezone, "start")
             conflict_title = escape(conflict.get("summary") or "другая встреча")
+            user = await self._load_user_by_telegram_id(message.from_user.id, session)
+            preferences = await self._get_user_preferences(user.id, session) if user else None
             suggestions = await self.calendar_service.suggest_free_slots(
                 access_token=access_token,
                 refresh_token=refresh_token,
@@ -2134,10 +2920,15 @@ class TelegramBotService:
                 visible = self._current_suggestion_options(pending)
                 time_text = conflict_start.strftime("%H:%M") if conflict_start else "это время"
                 tail = f" Еще рядом есть {visible[1]['label']}." if len(visible) > 1 else ""
+                overlap_hint = (
+                    " Если хочешь как обычно поставить поверх — это можно сделать первой кнопкой.\n"
+                    if preferences and preferences.prefers_overlap
+                    else "Если хочешь, могу и поставить прямо поверх.\n"
+                )
                 reply = (
                     f"Смотри, в {time_text} у тебя уже стоит «{conflict_title}».\n"
                     f"Зато могу поставить на {visible[0]['label']}.{tail}\n"
-                    "Если хочешь, могу и поставить прямо поверх.\n"
+                    f"{overlap_hint}"
                     "Выбирай вариант кнопкой ниже."
                 )
                 await message.answer(reply, reply_markup=self._suggestion_keyboard(pending))
@@ -2274,6 +3065,54 @@ class TelegramBotService:
         new_start = self._ensure_tz(datetime.fromisoformat(new_start_iso))
         new_end = self._ensure_tz(datetime.fromisoformat(new_end_iso))
 
+        if target.get("recurringEventId"):
+            options = [
+                {
+                    "scope": "single",
+                    "event_id": target["id"],
+                    "title": current_title,
+                    "recurring_event_id": target.get("recurringEventId"),
+                    "instance_start_iso": current_start.isoformat(),
+                    "label": f"Только этот — {self._event_option_label(current_title, current_start)}",
+                },
+                {
+                    "scope": "future",
+                    "event_id": target["id"],
+                    "title": current_title,
+                    "recurring_event_id": target.get("recurringEventId"),
+                    "instance_start_iso": current_start.isoformat(),
+                    "label": f"Этот и все следующие — {self._event_option_label(current_title, current_start)}",
+                },
+                {
+                    "scope": "series",
+                    "event_id": target.get("recurringEventId"),
+                    "title": current_title,
+                    "recurring_event_id": target.get("recurringEventId"),
+                    "instance_start_iso": current_start.isoformat(),
+                    "label": f"Всю серию — {current_title}",
+                },
+            ]
+            await self._set_selection_state(
+                message.from_user.id,
+                {
+                    "mode": "update_scope",
+                    "timezone": timezone,
+                    "new_title": new_title,
+                    "new_description": new_description,
+                    "new_start_iso": new_start.isoformat(),
+                    "new_end_iso": new_end.isoformat(),
+                    "options": options,
+                },
+                session,
+            )
+            reply = (
+                f"«{escape(current_title)}» — это повторяющееся событие.\n"
+                "Выбери, что именно менять: только этот повтор, этот и все следующие, или всю серию."
+            )
+            await message.answer(reply, reply_markup=self._selection_keyboard(options))
+            await self._remember(message.from_user.id, "assistant", reply, session)
+            return
+
         conflicts = await self.calendar_service.find_conflicts(
             access_token=access_token,
             refresh_token=refresh_token,
@@ -2286,6 +3125,8 @@ class TelegramBotService:
             conflict = conflicts[0]
             conflict_start = self.calendar_service.parse_event_datetime(conflict, timezone, "start")
             conflict_title = escape(conflict.get("summary") or "другая встреча")
+            user = await self._load_user_by_telegram_id(message.from_user.id, session)
+            preferences = await self._get_user_preferences(user.id, session) if user else None
             suggestions = await self.calendar_service.suggest_free_slots(
                 access_token=access_token,
                 refresh_token=refresh_token,
@@ -2318,9 +3159,15 @@ class TelegramBotService:
                 visible = self._current_suggestion_options(pending)
                 time_text = conflict_start.strftime("%H:%M") if conflict_start else "это время"
                 tail = f" Еще рядом есть {visible[1]['label']}." if len(visible) > 1 else ""
+                overlap_hint = (
+                    " Если хочешь оставить пересечение как обычно, можно поставить поверх той же кнопкой.\n"
+                    if preferences and preferences.prefers_overlap
+                    else ""
+                )
                 reply = (
                     f"Хотел перенести «{escape(current_title)}», но в {time_text} уже стоит «{conflict_title}».\n"
                     f"Могу вместо этого перенести на {visible[0]['label']}.{tail}\n"
+                    f"{overlap_hint}"
                     "Выбирай вариант кнопкой ниже."
                 )
                 await message.answer(reply, reply_markup=self._suggestion_keyboard(pending))
@@ -2409,6 +3256,8 @@ class TelegramBotService:
                     {
                         "event_id": event["id"],
                         "title": event.get("summary") or "Без названия",
+                        "recurring_event_id": event.get("recurringEventId"),
+                        "instance_start_iso": start.isoformat() if start else "",
                         "label": self._event_option_label(event.get("summary") or "Без названия", start),
                     }
                 )
@@ -2416,6 +3265,7 @@ class TelegramBotService:
                 message.from_user.id,
                 {
                     "mode": "cancel",
+                    "timezone": timezone,
                     "options": options,
                 },
                 session,
@@ -2426,6 +3276,28 @@ class TelegramBotService:
             return
 
         target = matches[0]
+        if target.get("recurringEventId"):
+            await self._offer_recurring_cancel_scope(
+                telegram_id=message.from_user.id,
+                event=target,
+                timezone=timezone,
+                session=session,
+            )
+            selection = await self._get_selection_state(message.from_user.id, session)
+            reply = (
+                f"«{escape(target.get('summary') or 'Событие')}» — это повторяющееся событие.\n"
+                "Выбери, что удалить: только этот день, этот и все следующие, или всю серию."
+            )
+            await message.answer(reply, reply_markup=self._selection_keyboard(selection["options"]))
+            await self._remember(message.from_user.id, "assistant", reply, session)
+            return
+
+        await self._record_undo_action(
+            session,
+            message.from_user.id,
+            "delete_event",
+            {"event_payload": self._event_recreate_payload(target)},
+        )
         await self.calendar_service.delete_event(
             access_token=access_token,
             refresh_token=refresh_token,

@@ -54,6 +54,20 @@ class GoogleAccount(Base):
     user: Mapped[User] = relationship(back_populates="google_account")
 
 
+class UserPreference(Base):
+    __tablename__ = "user_preferences"
+    __table_args__ = (UniqueConstraint("user_id", name="uq_user_preferences_user_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    default_reminder_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    prefers_overlap: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class ConversationState(Base):
     __tablename__ = "conversation_states"
 
@@ -85,4 +99,30 @@ class UsageEvent(Base):
     telegram_id: Mapped[int] = mapped_column(Integer, index=True)
     kind: Mapped[str] = mapped_column(String(64), index=True)
     payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class EventReminder(Base):
+    __tablename__ = "event_reminders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    telegram_id: Mapped[int] = mapped_column(Integer, index=True)
+    event_id: Mapped[str] = mapped_column(String(255), index=True)
+    event_title: Mapped[str] = mapped_column(String(255))
+    event_start_iso: Mapped[str] = mapped_column(String(64))
+    remind_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    minutes_before: Mapped[int] = mapped_column(Integer, default=10)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class UndoAction(Base):
+    __tablename__ = "undo_actions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_id: Mapped[int] = mapped_column(Integer, index=True)
+    kind: Mapped[str] = mapped_column(String(64), index=True)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    undone_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
