@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timedelta
+from difflib import SequenceMatcher
 from html import escape
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -16,7 +18,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
-from app.models import ConversationState, GoogleAccount, SelectionState, UsageEvent, User, UserStatus
+from app.models import ConversationState, EventReminder, GoogleAccount, SelectionState, UsageEvent, User, UserStatus
 from app.security import StateSigner
 from app.services.deepinfra import DeepInfraClient
 from app.services.google_calendar import GoogleCalendarService
@@ -78,16 +80,79 @@ class TelegramBotService:
     def _format_time(self, value: datetime) -> str:
         return value.astimezone(self._tz()).strftime("%H:%M")
 
+    @staticmethod
+    def _normalize_event_text(value: str) -> str:
+        cleaned = value.lower().replace("ё", "е")
+        cleaned = re.sub(r"[^a-zа-я0-9\s]", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        aliases = {
+            "уник": "универ",
+            "универ": "универ",
+            "универс": "универ",
+            "качалка": "зал",
+            "зал": "зал",
+            "треня": "тренировка",
+            "тренька": "тренировка",
+            "созвон": "созвон",
+            "кол": "коля",
+        }
+        tokens = [aliases.get(token, token) for token in cleaned.split()]
+        return " ".join(tokens)
+
+    def _event_match_score(self, query: str, summary: str) -> float:
+        normalized_query = self._normalize_event_text(query)
+        normalized_summary = self._normalize_event_text(summary)
+        if not normalized_query:
+            return 1.0
+        if normalized_query in normalized_summary:
+            return 1.0
+        query_tokens = set(normalized_query.split())
+        summary_tokens = set(normalized_summary.split())
+        overlap = len(query_tokens & summary_tokens)
+        token_score = overlap / max(1, len(query_tokens))
+        similarity = SequenceMatcher(None, normalized_query, normalized_summary).ratio()
+        prefix = normalized_query[:3]
+        prefix_bonus = 0.15 if len(prefix) == 3 and normalized_summary.startswith(prefix) else 0.0
+        return max(similarity, token_score + prefix_bonus)
+
+    def _filter_matching_events(self, events: list[dict], title_query: str) -> list[dict]:
+        if not title_query:
+            return events
+        scored: list[tuple[float, dict]] = []
+        for event in events:
+            summary = event.get("summary") or ""
+            score = self._event_match_score(title_query, summary)
+            if score >= 0.45:
+                scored.append((score, event))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [event for _, event in scored]
+
+    def _apply_event_template(self, title: str, description: str) -> tuple[str, str]:
+        normalized = self._normalize_event_text(title)
+        if normalized in {"зал", "качалка", "тренировка"}:
+            return "Зал", description
+        if normalized in {"созвон", "митинг", "встреча"}:
+            return "Созвон", description
+        if normalized in {"универ", "университет"}:
+            return "Универ", description
+        return title, description
+
     def _ensure_tz(self, value: datetime) -> datetime:
         return value if value.tzinfo else value.replace(tzinfo=self._tz())
 
     @staticmethod
     def _is_yes(text: str) -> bool:
-        return text.strip().lower() in {"да", "ага", "ок", "окей", "давай", "yes", "создавай"}
+        cleaned = text.strip().lower()
+        if cleaned in {"да", "ага", "ок", "окей", "давай", "yes", "создавай"}:
+            return True
+        return cleaned.startswith("да")
 
     @staticmethod
     def _is_no(text: str) -> bool:
-        return text.strip().lower() in {"нет", "неа", "отмена", "cancel", "no"}
+        cleaned = text.strip().lower()
+        if cleaned in {"нет", "неа", "отмена", "cancel", "no"}:
+            return True
+        return cleaned.startswith("не") and len(cleaned) <= 6
 
     @staticmethod
     def _is_reaction(text: str) -> bool:
@@ -242,6 +307,73 @@ class TelegramBotService:
         )
         await session.commit()
 
+    async def _schedule_event_reminder(
+        self,
+        *,
+        session: AsyncSession,
+        user_id: int,
+        telegram_id: int,
+        event_id: str,
+        event_title: str,
+        event_start_iso: str,
+        minutes_before: int,
+    ) -> None:
+        remind_at = self._ensure_tz(datetime.fromisoformat(event_start_iso)) - timedelta(minutes=minutes_before)
+        session.add(
+            EventReminder(
+                user_id=user_id,
+                telegram_id=telegram_id,
+                event_id=event_id,
+                event_title=event_title,
+                event_start_iso=event_start_iso,
+                remind_at=remind_at,
+                minutes_before=minutes_before,
+            )
+        )
+        await session.commit()
+
+    async def run_reminder_loop(self) -> None:
+        while True:
+            try:
+                async with self.session_factory() as session:
+                    now = datetime.now(self._tz())
+                    result = await session.execute(
+                        select(EventReminder).where(
+                            EventReminder.sent_at.is_(None),
+                            EventReminder.remind_at <= now,
+                        )
+                    )
+                    reminders = result.scalars().all()
+                    for reminder in reminders:
+                        start_at = self._ensure_tz(datetime.fromisoformat(reminder.event_start_iso))
+                        reply = (
+                            f"Напоминалка: скоро «{escape(reminder.event_title)}».\n"
+                            f"Старт в {self._format_dt(start_at)}."
+                        )
+                        await self.bot.send_message(reminder.telegram_id, reply)
+                        reminder.sent_at = now
+                    if reminders:
+                        await session.commit()
+            except Exception:
+                logger.exception("reminder_loop_failed")
+            await asyncio.sleep(30)
+
+    def _window_hours_for_day_parts(self, day_parts: list[str], earliest_time: str | None, latest_time: str | None) -> tuple[int, int]:
+        if earliest_time and latest_time:
+            return int(earliest_time.split(":")[0]), int(latest_time.split(":")[0])
+        if earliest_time and not latest_time:
+            return int(earliest_time.split(":")[0]), 23
+        parts = set(day_parts)
+        if "morning" in parts:
+            return 8, 12
+        if "afternoon" in parts:
+            return 12, 18
+        if "evening" in parts:
+            return 18, 23
+        if "night" in parts:
+            return 20, 23
+        return 9, 23
+
     def _current_suggestion_options(self, pending: dict[str, Any]) -> list[dict[str, Any]]:
         options = pending.get("options", [])
         offset = pending.get("offset", 0)
@@ -295,8 +427,9 @@ class TelegramBotService:
         return InlineKeyboardMarkup(
             inline_keyboard=[
                 [
-                    InlineKeyboardButton(text="Создать", callback_data=ActionCallback(action="confirm_create").pack()),
-                    InlineKeyboardButton(text="Отмена", callback_data=ActionCallback(action="cancel_create").pack()),
+                    self._action_button("Да", ActionCallback(action="confirm_create").pack(), style="success"),
+                    self._action_button("Изменить", ActionCallback(action="edit_draft").pack(), style="primary"),
+                    self._action_button("Отмена", ActionCallback(action="cancel_create").pack(), style="danger"),
                 ]
             ]
         )
@@ -310,9 +443,10 @@ class TelegramBotService:
         if pending.get("requested_start_iso") and pending.get("requested_end_iso"):
             rows.append(
                 [
-                    InlineKeyboardButton(
+                    self._action_button(
                         text="Поставить поверх",
                         callback_data=ActionCallback(action="allow_overlap").pack(),
+                        style="danger",
                     )
                 ]
             )
@@ -320,28 +454,51 @@ class TelegramBotService:
         for local_index, option in enumerate(visible):
             rows.append(
                 [
-                    InlineKeyboardButton(
+                    self._action_button(
                         text=option["label"],
                         callback_data=ActionCallback(action="pick_suggestion", option=offset + local_index).pack(),
+                        style="primary",
                     )
                 ]
             )
 
         if offset + self.SUGGESTION_PAGE_SIZE < total:
             rows.append(
-                [InlineKeyboardButton(text="Еще варианты", callback_data=ActionCallback(action="more_suggestions").pack())]
+                [self._action_button("Еще варианты", ActionCallback(action="more_suggestions").pack(), style="primary")]
             )
 
-        rows.append([InlineKeyboardButton(text="Отмена", callback_data=ActionCallback(action="cancel_create").pack())])
+        rows.append([self._action_button("Отмена", ActionCallback(action="cancel_create").pack(), style="danger")])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     def _selection_keyboard(self, options: list[dict[str, Any]]) -> InlineKeyboardMarkup:
         rows = [
-            [InlineKeyboardButton(text=option["label"], callback_data=ActionCallback(action="pick_selection", option=index).pack())]
+            [self._action_button(option["label"], ActionCallback(action="pick_selection", option=index).pack(), style="primary")]
             for index, option in enumerate(options[:5])
         ]
-        rows.append([InlineKeyboardButton(text="Отмена", callback_data=ActionCallback(action="cancel_create").pack())])
+        rows.append([self._action_button("Отмена", ActionCallback(action="cancel_create").pack(), style="danger")])
         return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def _next_event_keyboard(self, *, can_remind_10: bool, can_remind_60: bool) -> InlineKeyboardMarkup | None:
+        row: list[InlineKeyboardButton] = []
+        if can_remind_10:
+            row.append(self._action_button("Напомнить за 10 мин", ActionCallback(action="remind_next_10").pack(), style="primary"))
+        if can_remind_60:
+            row.append(self._action_button("Напомнить за час", ActionCallback(action="remind_next_60").pack(), style="primary"))
+        if not row:
+            return None
+        return InlineKeyboardMarkup(inline_keyboard=[row])
+
+    def _action_button(self, text: str, callback_data: str, *, style: str | None = None) -> InlineKeyboardButton:
+        extra_data: dict[str, Any] = {}
+        if style:
+            extra_data["style"] = style
+        return InlineKeyboardButton(text=text, callback_data=callback_data, **extra_data)
+
+    def _event_option_label(self, title: str, start: datetime | None) -> str:
+        title = title or "Без названия"
+        if not start:
+            return f"весь день — {title}"
+        return f"{start.strftime('%d.%m %H:%M')} — {title}"
 
     def _user_help_text(self) -> str:
         return (
@@ -514,11 +671,18 @@ class TelegramBotService:
 
         if start and end and start <= now <= end:
             reply = f"Сейчас у тебя идет «{summary}» до {end.strftime('%H:%M')}.{follow_up}"
+            markup = None
         elif start:
             reply = f"Дальше у тебя «{summary}» в {self._format_dt(start)}.{follow_up}"
+            minutes_until = int((start - now).total_seconds() // 60)
+            markup = self._next_event_keyboard(
+                can_remind_10=minutes_until > 10,
+                can_remind_60=minutes_until > 60,
+            )
         else:
             reply = f"Дальше у тебя событие «{summary}»."
-        await message.answer(reply)
+            markup = None
+        await message.answer(reply, reply_markup=markup)
         await self._remember(message.from_user.id, "assistant", reply, session)
 
     async def _create_calendar_entry(
@@ -689,6 +853,29 @@ class TelegramBotService:
             )
             return True
 
+        if mode == "create_recurring":
+            link = await self.calendar_service.create_recurring_event(
+                access_token=access_token,
+                refresh_token=refresh_token,
+                title=pending["title"],
+                description=pending["description"],
+                start_iso=pending["start_iso"],
+                end_iso=pending["end_iso"],
+                timezone=pending["timezone"],
+                recurrence_rule=pending["recurrence_rule"],
+            )
+            await self._set_pending_confirmation(message.from_user.id, None, session)
+            reply = f"Готово, создал повторяющееся событие.\n<a href=\"{link}\">Открыть в Google Calendar</a>"
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", f"Создал повторяющееся событие {pending['title']}.", session)
+            await self._log_usage(
+                session,
+                message.from_user.id,
+                "event_created_recurring",
+                {"title": pending["title"], "start_iso": pending.get("start_iso")},
+            )
+            return True
+
         link = await self._create_calendar_entry(
             access_token=access_token,
             refresh_token=refresh_token,
@@ -767,6 +954,37 @@ class TelegramBotService:
         await message.answer(reply, reply_markup=self._confirm_keyboard())
         await self._remember(message.from_user.id, "assistant", f"Обновил черновик {title} на {self._format_dt(start_at)}.", session)
         return True
+
+    async def _handle_pending_state_clarification(self, message: Message, session: AsyncSession) -> bool:
+        user_id = message.from_user.id
+
+        if await self._get_selection_state(user_id, session):
+            reply = "Я сейчас жду, что ты выберешь один из вариантов кнопкой ниже. Если не подходит, жми «Отмена»."
+            await message.answer(reply)
+            await self._remember(user_id, "assistant", reply, session)
+            return True
+
+        pending_suggestions = await self._get_pending_suggestions(user_id, session)
+        if pending_suggestions:
+            if pending_suggestions.get("requested_start_iso"):
+                reply = "Я сейчас жду выбор по конфликту: можно нажать на свободный слот, «Поставить поверх» или «Отмена»."
+            else:
+                reply = "Я сейчас жду, что ты выберешь один из предложенных слотов кнопкой ниже или нажмёшь «Отмена»."
+            await message.answer(reply)
+            await self._remember(user_id, "assistant", reply, session)
+            return True
+
+        pending_confirmation = await self._get_pending_confirmation(user_id, session)
+        if pending_confirmation:
+            if pending_confirmation.get("mode") == "create_batch":
+                reply = "Я сейчас жду подтверждение по пачке событий. Можешь ответить «да», «нет» или переформулировать всё сообщение целиком."
+            else:
+                reply = "Я сейчас жду подтверждение по черновику. Можешь ответить «да», «нет» или написать правку вроде «не в 15, а в 16»."
+            await message.answer(reply)
+            await self._remember(user_id, "assistant", reply, session)
+            return True
+
+        return False
 
     async def _contextual_reply(self, message: Message, text: str, session: AsyncSession) -> bool:
         if not self._is_reaction(text):
@@ -853,6 +1071,34 @@ class TelegramBotService:
             await self._remember(message.from_user.id, "assistant", reply, session)
             return
 
+        if intent == "plan_events":
+            await self._process_planning_request(
+                message=message,
+                text=text,
+                refresh_token=refresh_token,
+                access_token=access_token,
+                session=session,
+            )
+            return
+
+        if intent == "set_reminder":
+            result = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
+            user = result.scalar_one_or_none()
+            if not user:
+                reply = "Не нашел твой профиль, попробуй еще раз."
+                await message.answer(reply)
+                await self._remember(message.from_user.id, "assistant", reply, session)
+                return
+            await self._process_reminder_request(
+                message=message,
+                text=text,
+                refresh_token=refresh_token,
+                access_token=access_token,
+                user=user,
+                session=session,
+            )
+            return
+
         if intent == "create_event":
             await self._process_event_request(
                 message=message,
@@ -902,6 +1148,229 @@ class TelegramBotService:
             {"role": "user", "content": text},
         ]
         reply = await self.deepinfra.chat_text(prompt, temperature=0.4)
+        await message.answer(reply)
+        await self._remember(message.from_user.id, "assistant", reply, session)
+
+    async def _process_planning_request(
+        self,
+        *,
+        message: Message,
+        text: str,
+        refresh_token: str,
+        access_token: str | None,
+        session: AsyncSession,
+    ) -> None:
+        parsed = await self.parser.parse_planning_request(text)
+        if parsed.get("needs_clarification"):
+            reply = parsed.get("clarification_question") or "Уточни, пожалуйста, в какие дни и с какого времени тебе искать слот."
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
+            return
+        if not parsed.get("should_plan"):
+            await self._friendly_fallback(message, text, session)
+            return
+
+        dates = parsed.get("dates") or []
+        if not dates:
+            reply = "Мне нужны хотя бы конкретные дни, чтобы подобрать свободные окна."
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
+            return
+
+        timezone = parsed.get("timezone") or self.settings.default_timezone
+        title, description = self._apply_event_template(
+            parsed.get("title") or "Новое событие",
+            parsed.get("description") or text,
+        )
+        duration_minutes = max(15, int(parsed.get("duration_minutes") or 60))
+        earliest_time = parsed.get("earliest_time")
+        latest_time = parsed.get("latest_time")
+        day_parts = parsed.get("day_parts") or []
+        start_hour, end_hour = self._window_hours_for_day_parts(day_parts, earliest_time, latest_time)
+        count = int(parsed.get("count") or len(dates) or 1)
+
+        items: list[dict[str, Any]] = []
+        unavailable: list[str] = []
+        for date_iso in dates[:count]:
+            day = datetime.fromisoformat(date_iso).replace(tzinfo=self._tz())
+            if earliest_time:
+                hour, minute = map(int, earliest_time.split(":"))
+            else:
+                hour, minute = start_hour, 0
+            if latest_time:
+                end_hour_exact, end_minute = map(int, latest_time.split(":"))
+            else:
+                end_hour_exact, end_minute = end_hour, 0
+            window_start = day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            window_end = day.replace(hour=end_hour_exact, minute=end_minute, second=0, microsecond=0)
+            if window_end <= window_start:
+                window_end = window_start + timedelta(hours=4)
+
+            slot = await self.calendar_service.find_first_free_slot_in_window(
+                access_token=access_token,
+                refresh_token=refresh_token,
+                window_start=window_start,
+                window_end=window_end,
+                duration_minutes=duration_minutes,
+                timezone=timezone,
+            )
+            if not slot:
+                unavailable.append(day.strftime("%d.%m"))
+                continue
+            slot_start, slot_end = slot
+            items.append(
+                {
+                    "title": title,
+                    "description": description,
+                    "start_iso": slot_start.isoformat(),
+                    "end_iso": slot_end.isoformat(),
+                    "timezone": timezone,
+                }
+            )
+
+        if not items:
+            reply = "Я не нашел нормальных свободных окон под это в указанные дни. Давай сузим время или выберем другие дни."
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
+            return
+
+        await self._set_pending_confirmation(
+            message.from_user.id,
+            {"mode": "create_batch", "items": items},
+            session,
+        )
+        reply = "Нашел такие слоты:\n" + self._describe_pending({"items": items})
+        if unavailable:
+            reply += "\n\nНе нашел окно в: " + ", ".join(unavailable)
+        reply += "\n\nЕсли все ок, ответь «да» или жми кнопку."
+        await message.answer(reply, reply_markup=self._confirm_keyboard())
+        await self._remember(message.from_user.id, "assistant", reply, session)
+
+    async def _process_recurring_request(
+        self,
+        *,
+        message: Message,
+        text: str,
+        session: AsyncSession,
+    ) -> bool:
+        parsed = await self.parser.parse_recurring_request(text)
+        if parsed.get("needs_clarification"):
+            reply = parsed.get("clarification_question") or "Уточни, пожалуйста, в какие дни и во сколько повторять событие."
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
+            return True
+        if not parsed.get("should_create"):
+            return False
+
+        title, description = self._apply_event_template(
+            parsed.get("title") or "Новое событие",
+            parsed.get("description") or text,
+        )
+        pending = {
+            "mode": "create_recurring",
+            "title": title,
+            "description": description,
+            "start_iso": parsed["start_iso"],
+            "end_iso": parsed["end_iso"],
+            "timezone": parsed.get("timezone") or self.settings.default_timezone,
+            "recurrence_rule": parsed["recurrence_rule"],
+        }
+        await self._set_pending_confirmation(message.from_user.id, pending, session)
+        reply = (
+            "Понял так, создаем повторяющееся событие:\n"
+            f"{self._describe_pending(pending)}\n"
+            f"Правило: <code>{escape(parsed['recurrence_rule'])}</code>\n\n"
+            "Если всё так, ответь «да» или жми кнопку."
+        )
+        await message.answer(reply, reply_markup=self._confirm_keyboard())
+        await self._remember(message.from_user.id, "assistant", reply, session)
+        return True
+
+    async def _process_reminder_request(
+        self,
+        *,
+        message: Message,
+        text: str,
+        refresh_token: str,
+        access_token: str | None,
+        user: User,
+        session: AsyncSession,
+    ) -> None:
+        parsed = await self.parser.parse_reminder_request(text)
+        if parsed.get("needs_clarification"):
+            reply = parsed.get("clarification_question") or "Уточни, пожалуйста, к какому именно событию поставить напоминание."
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
+            return
+        if not parsed.get("should_set"):
+            await self._friendly_fallback(message, text, session)
+            return
+
+        timezone = parsed.get("timezone") or self.settings.default_timezone
+        time_min = self._ensure_tz(datetime.fromisoformat(parsed["search_from_iso"]))
+        time_max = self._ensure_tz(datetime.fromisoformat(parsed["search_to_iso"]))
+        minutes_before = max(1, int(parsed.get("minutes_before") or 10))
+        title_query = (parsed.get("title_query") or "").strip()
+
+        events = await self.calendar_service.list_events(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            time_min=time_min,
+            time_max=time_max,
+            timezone=timezone,
+            limit=30,
+        )
+        matches = self._filter_matching_events(events, title_query)
+        if not matches:
+            reply = "Не нашел подходящее событие для напоминания. Назови его чуть точнее или добавь день."
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
+            return
+
+        if len(matches) > 1:
+            options = []
+            for event in matches[:5]:
+                start = self.calendar_service.parse_event_datetime(event, timezone, "start")
+                options.append(
+                    {
+                        "event_id": event["id"],
+                        "title": event.get("summary") or "Без названия",
+                        "event_start_iso": start.isoformat() if start else "",
+                        "label": self._event_option_label(event.get("summary") or "Без названия", start),
+                    }
+                )
+            await self._set_selection_state(
+                message.from_user.id,
+                {
+                    "mode": "reminder",
+                    "minutes_before": minutes_before,
+                    "options": options,
+                },
+                session,
+            )
+            reply = "Нашел несколько похожих событий. Выбери, на какое именно поставить напоминание."
+            await message.answer(reply, reply_markup=self._selection_keyboard(options))
+            await self._remember(message.from_user.id, "assistant", reply, session)
+            return
+
+        target = matches[0]
+        start = self.calendar_service.parse_event_datetime(target, timezone, "start")
+        if not start:
+            reply = "У этого события странное время, пока не могу надежно поставить напоминание."
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
+            return
+
+        await self._schedule_event_reminder(
+            session=session,
+            user_id=user.id,
+            telegram_id=message.from_user.id,
+            event_id=target["id"],
+            event_title=target.get("summary") or "Без названия",
+            event_start_iso=start.isoformat(),
+            minutes_before=minutes_before,
+        )
+        reply = f"Готово, напомню про «{escape(target.get('summary') or 'событие')}» за {minutes_before} мин."
         await message.answer(reply)
         await self._remember(message.from_user.id, "assistant", reply, session)
 
@@ -1093,6 +1562,9 @@ class TelegramBotService:
             if await self._handle_pending_confirmation_update(message=message, session=session):
                 return
 
+            if await self._handle_pending_state_clarification(message, session):
+                return
+
             text = message.text or ""
             await self._remember(message.from_user.id, "user", text, session)
             await self._route_intent(
@@ -1141,6 +1613,25 @@ class TelegramBotService:
                 await callback.message.answer(reply)
                 await self._remember(user_id, "assistant", reply, session)
                 await callback.answer()
+                return
+
+            if callback_data.action == "edit_draft":
+                pending = await self._get_pending_confirmation(user_id, session)
+                if not pending:
+                    await callback.answer("Черновик уже устарел.", show_alert=True)
+                    return
+                mode = pending.get("mode", "create")
+                if mode == "create_batch":
+                    reply = "Ок, поправь весь запрос целиком текстом. Например: «не четверг и пятница, а только пятница вечером»."
+                elif mode == "update":
+                    reply = "Ок, напиши, что поменять. Например: «не в 15, а в 16» или «не на час, а на 30 минут»."
+                elif mode == "create_recurring":
+                    reply = "Ок, напиши правку текстом. Например: «не по вторникам, а по средам» или «не в 19:00, а в 20:00»."
+                else:
+                    reply = "Ок, напиши правку текстом. Например: «не в 15, а в 16» или «не на час, а на 30 минут»."
+                await callback.answer()
+                await callback.message.answer(reply)
+                await self._remember(user_id, "assistant", reply, session)
                 return
 
             if callback_data.action == "pick_selection":
@@ -1196,6 +1687,56 @@ class TelegramBotService:
                     await self._remember(user_id, "assistant", reply, session)
                     await callback.answer()
                     return
+
+                if mode == "reminder":
+                    await self._schedule_event_reminder(
+                        session=session,
+                        user_id=user.id,
+                        telegram_id=user_id,
+                        event_id=option["event_id"],
+                        event_title=option["title"],
+                        event_start_iso=option["event_start_iso"],
+                        minutes_before=int(selection["minutes_before"]),
+                    )
+                    reply = f"Готово, напомню про «{escape(option['title'])}» за {selection['minutes_before']} мин."
+                    await callback.message.answer(reply)
+                    await self._remember(user_id, "assistant", reply, session)
+                    await callback.answer()
+                    return
+
+            if callback_data.action in {"remind_next_10", "remind_next_60"}:
+                minutes_before = 10 if callback_data.action.endswith("_10") else 60
+                event = await self.calendar_service.get_next_event(
+                    access_token=google_account.access_token,
+                    refresh_token=google_account.refresh_token,
+                    timezone=self.settings.default_timezone,
+                )
+                if not event:
+                    await callback.answer("Ближайшее событие не нашёл.", show_alert=True)
+                    return
+                start = self.calendar_service.parse_event_datetime(event, self.settings.default_timezone, "start")
+                if not start:
+                    await callback.answer("У этого события не получилось прочитать время.", show_alert=True)
+                    return
+                if start <= datetime.now(self._tz()):
+                    await callback.answer("Это событие уже началось, напоминание не поставлю.", show_alert=True)
+                    return
+
+                await self._schedule_event_reminder(
+                    session=session,
+                    user_id=user.id,
+                    telegram_id=user_id,
+                    event_id=event["id"],
+                    event_title=event.get("summary") or "Без названия",
+                    event_start_iso=start.isoformat(),
+                    minutes_before=minutes_before,
+                )
+                reply = f"Готово, напомню про «{escape(event.get('summary') or 'событие')}» за {minutes_before} мин."
+                await callback.answer("Напоминание поставил")
+                await callback.message.answer(reply)
+                await self._remember(user_id, "assistant", reply, session)
+                await callback.message.edit_reply_markup(reply_markup=None)
+                return
 
             if callback_data.action == "confirm_create":
                 pending = await self._get_pending_confirmation(user_id, session)
@@ -1258,6 +1799,30 @@ class TelegramBotService:
                         user_id,
                         "event_batch_processed",
                         {"created": len(created), "skipped": len(skipped)},
+                    )
+                    await callback.answer()
+                    return
+                if mode == "create_recurring":
+                    link = await self.calendar_service.create_recurring_event(
+                        access_token=google_account.access_token,
+                        refresh_token=google_account.refresh_token,
+                        title=pending["title"],
+                        description=pending["description"],
+                        start_iso=pending["start_iso"],
+                        end_iso=pending["end_iso"],
+                        timezone=pending["timezone"],
+                        recurrence_rule=pending["recurrence_rule"],
+                    )
+                    await self._set_pending_confirmation(user_id, None, session)
+                    await callback.message.edit_reply_markup(reply_markup=None)
+                    reply = f"Готово, создал повторяющееся событие.\n<a href=\"{link}\">Открыть в Google Calendar</a>"
+                    await callback.message.answer(reply)
+                    await self._remember(user_id, "assistant", f"Создал повторяющееся событие {pending['title']}.", session)
+                    await self._log_usage(
+                        session,
+                        user_id,
+                        "event_created_recurring",
+                        {"title": pending["title"], "start_iso": pending.get("start_iso")},
                     )
                     await callback.answer()
                     return
@@ -1459,6 +2024,8 @@ class TelegramBotService:
     ) -> None:
         memory = await self._memory_prompt(message.from_user.id, session)
         parsing_input = text if not memory else f"Recent conversation:\n{memory}\n\nCurrent message:\n{text}"
+        if await self._process_recurring_request(message=message, text=parsing_input, session=session):
+            return
         parsed_multi = await self.parser.parse_events(parsing_input)
         if parsed_multi.get("needs_clarification"):
             reply = parsed_multi.get("clarification_question") or "Нужно чуть точнее понять дату или время."
@@ -1479,12 +2046,16 @@ class TelegramBotService:
                     return
 
                 timezone = raw_item.get("timezone") or self.settings.default_timezone
+                title, description = self._apply_event_template(
+                    raw_item.get("title") or "Новое событие",
+                    raw_item.get("description") or text,
+                )
                 start_at = self._ensure_tz(datetime.fromisoformat(start_iso))
                 end_at = self._ensure_tz(datetime.fromisoformat(end_iso))
                 items.append(
                     {
-                        "title": raw_item.get("title") or "Новое событие",
-                        "description": raw_item.get("description") or text,
+                        "title": title,
+                        "description": description,
                         "start_iso": start_at.isoformat(),
                         "end_iso": end_at.isoformat(),
                         "timezone": timezone,
@@ -1584,8 +2155,10 @@ class TelegramBotService:
             await self._remember(message.from_user.id, "assistant", reply, session)
             return
 
-        title = parsed.get("title") or "Новое событие"
-        description = parsed.get("description") or text
+        title, description = self._apply_event_template(
+            parsed.get("title") or "Новое событие",
+            parsed.get("description") or text,
+        )
         await self._set_pending_confirmation(
             message.from_user.id,
             {
@@ -1639,11 +2212,7 @@ class TelegramBotService:
             timezone=timezone,
             limit=30,
         )
-        matches = []
-        for event in events:
-            summary = (event.get("summary") or "").lower()
-            if not title_query or title_query in summary:
-                matches.append(event)
+        matches = self._filter_matching_events(events, title_query)
 
         if not matches:
             reply = "Не нашел подходящее событие для переноса. Назови его чуть точнее."
@@ -1666,7 +2235,7 @@ class TelegramBotService:
                             if self.calendar_service.parse_event_datetime(event, timezone, "end")
                             else ""
                         ),
-                        "label": f"{start.strftime('%d.%m %H:%M') if start else 'весь день'} — {escape(event.get('summary') or 'Без названия')}",
+                        "label": self._event_option_label(event.get("summary") or "Без названия", start),
                     }
                 )
             await self._set_selection_state(
@@ -1824,11 +2393,7 @@ class TelegramBotService:
             limit=30,
         )
 
-        matches = []
-        for event in events:
-            summary = (event.get("summary") or "").lower()
-            if not title_query or title_query in summary:
-                matches.append(event)
+        matches = self._filter_matching_events(events, title_query)
 
         if not matches:
             reply = "Не нашел подходящее событие в календаре. Попробуй точнее назвать его или дату."
@@ -1844,7 +2409,7 @@ class TelegramBotService:
                     {
                         "event_id": event["id"],
                         "title": event.get("summary") or "Без названия",
-                        "label": f"{start.strftime('%d.%m %H:%M') if start else 'весь день'} — {escape(event.get('summary') or 'Без названия')}",
+                        "label": self._event_option_label(event.get("summary") or "Без названия", start),
                     }
                 )
             await self._set_selection_state(
