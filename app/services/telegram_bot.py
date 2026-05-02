@@ -1505,8 +1505,49 @@ class TelegramBotService:
 
     async def _handle_pending_state_clarification(self, message: Message, session: AsyncSession) -> bool:
         user_id = message.from_user.id
+        text = (message.text or "").strip()
 
-        if await self._get_selection_state(user_id, session):
+        selection = await self._get_selection_state(user_id, session)
+        if selection:
+            mode = selection.get("mode")
+            options = selection.get("options", [])
+            if mode == "cancel":
+                lowered = text.lower()
+                if any(word in lowered for word in ("повтор", "повторение", "серия", "всю серию")):
+                    reply = "Можно. Для повторяющегося события я умею удалить один день, этот и все следующие или всю серию. Выбери вариант кнопкой ниже."
+                    await message.answer(reply)
+                    await self._remember(user_id, "assistant", reply, session)
+                    return True
+
+                if text:
+                    recurring_matches = [
+                        option
+                        for option in options
+                        if option.get("recurring_event_id")
+                        and self._event_match_score(text, option.get("title") or "") >= 0.45
+                    ]
+                    if recurring_matches:
+                        chosen = recurring_matches[0]
+                        await self._offer_recurring_cancel_scope(
+                            telegram_id=user_id,
+                            event={
+                                "id": chosen["event_id"],
+                                "summary": chosen["title"],
+                                "recurringEventId": chosen.get("recurring_event_id"),
+                                "start": {"dateTime": chosen.get("instance_start_iso")},
+                            },
+                            timezone=selection.get("timezone") or self.settings.default_timezone,
+                            session=session,
+                        )
+                        new_selection = await self._get_selection_state(user_id, session)
+                        reply = (
+                            f"«{escape(chosen['title'])}» — это повторяющееся событие.\n"
+                            "Выбери, что удалить: только один день, этот и все следующие или всю серию."
+                        )
+                        await message.answer(reply, reply_markup=self._selection_keyboard(new_selection["options"]))
+                        await self._remember(user_id, "assistant", reply, session)
+                        return True
+
             reply = "Я сейчас жду, что ты выберешь один из вариантов кнопкой ниже. Если не подходит, жми «Отмена»."
             await message.answer(reply)
             await self._remember(user_id, "assistant", reply, session)
@@ -2274,10 +2315,22 @@ class TelegramBotService:
             google_account = await self._get_google_account(user.id, session)
 
             if callback_data.action == "cancel_create":
+                selection = await self._get_selection_state(user_id, session)
+                pending_confirmation = await self._get_pending_confirmation(user_id, session)
+                pending_suggestions = await self._get_pending_suggestions(user_id, session)
                 await self._clear_pending_state(user_id, session)
                 await self._set_selection_state(user_id, None, session)
                 await callback.message.edit_reply_markup(reply_markup=None)
-                reply = "Окей, ничего не создаю."
+                if selection:
+                    reply = "Окей, отменил этот выбор."
+                elif pending_suggestions:
+                    reply = "Окей, этот вариант отменил."
+                elif pending_confirmation and pending_confirmation.get("mode", "").startswith("update"):
+                    reply = "Окей, ничего не меняю."
+                elif pending_confirmation and pending_confirmation.get("mode") == "cancel":
+                    reply = "Окей, ничего не удаляю."
+                else:
+                    reply = "Окей, ничего не создаю."
                 await callback.message.answer(reply)
                 await self._remember(user_id, "assistant", reply, session)
                 await callback.answer()
@@ -3432,7 +3485,8 @@ class TelegramBotService:
     ) -> None:
         timezone = self.settings.default_timezone
         parsed = None
-        if self._looks_like_recurring_request(text):
+        recurring_cancel_hint = self._looks_like_recurring_request(text)
+        if recurring_cancel_hint:
             parsed = self._quick_cancel_parse(text, timezone)
         if parsed is None:
             parsed = await self.parser.parse_cancel_request(text)
@@ -3468,6 +3522,58 @@ class TelegramBotService:
             return
 
         if len(matches) > 1:
+            if recurring_cancel_hint:
+                recurring_groups: dict[str, dict[str, Any]] = {}
+                for event in matches:
+                    recurring_id = event.get("recurringEventId")
+                    if not recurring_id:
+                        continue
+                    recurring_groups.setdefault(recurring_id, event)
+
+                if len(recurring_groups) == 1:
+                    target = next(iter(recurring_groups.values()))
+                    await self._offer_recurring_cancel_scope(
+                        telegram_id=message.from_user.id,
+                        event=target,
+                        timezone=timezone,
+                        session=session,
+                    )
+                    selection = await self._get_selection_state(message.from_user.id, session)
+                    reply = (
+                        f"«{escape(target.get('summary') or 'Событие')}» — это повторяющееся событие.\n"
+                        "Выбери, что удалить: только один день, этот и все следующие, или всю серию."
+                    )
+                    await message.answer(reply, reply_markup=self._selection_keyboard(selection["options"]))
+                    await self._remember(message.from_user.id, "assistant", reply, session)
+                    return
+
+                if recurring_groups:
+                    options = []
+                    for event in list(recurring_groups.values())[:5]:
+                        start = self.calendar_service.parse_event_datetime(event, timezone, "start")
+                        options.append(
+                            {
+                                "event_id": event["id"],
+                                "title": event.get("summary") or "Без названия",
+                                "recurring_event_id": event.get("recurringEventId"),
+                                "instance_start_iso": start.isoformat() if start else "",
+                                "label": f"Серия: {self._event_option_label(event.get('summary') or 'Без названия', start)}",
+                            }
+                        )
+                    await self._set_selection_state(
+                        message.from_user.id,
+                        {
+                            "mode": "cancel",
+                            "timezone": timezone,
+                            "options": options,
+                        },
+                        session,
+                    )
+                    reply = "Нашел несколько повторяющихся серий. Выбери, какую серию хочешь удалить."
+                    await message.answer(reply, reply_markup=self._selection_keyboard(options))
+                    await self._remember(message.from_user.id, "assistant", reply, session)
+                    return
+
             options = []
             for event in matches[:5]:
                 start = self.calendar_service.parse_event_datetime(event, timezone, "start")
