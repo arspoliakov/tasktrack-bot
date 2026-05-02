@@ -60,6 +60,9 @@ class TaskParser:
                     "If earliest exact time is given, put it into earliest_time as HH:MM. "
                     "If no latest_time is given, infer it from day_parts when possible. "
                     "If the user says evening and gives no exact time, use needs_clarification=true unless you can still safely plan by asking a short follow-up. "
+                    "The input may include recent conversation context. Reuse dates, day parts, and time constraints that the user already stated earlier in the same conversation. "
+                    "Do not ask again for a date, day part, or time range if it is already clear from the recent conversation. "
+                    "Ask at most one short clarification question and only for the single missing piece. "
                     "count is how many separate events the user wants to place. "
                     "clarification_question must be short, friendly, and in Russian, addressing the user as 'ты'."
                 ),

@@ -704,6 +704,9 @@ class TelegramBotService:
             windows.append(f"{self._format_time(cursor)}–{self._format_time(day_end)}")
         return ", ".join(windows[:3])
 
+    def _duration_minutes(self, start_at: datetime, end_at: datetime) -> int:
+        return max(1, int((end_at - start_at).total_seconds() // 60))
+
     def _confirm_keyboard(self) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             inline_keyboard=[
@@ -1479,25 +1482,40 @@ class TelegramBotService:
         end_at = self._ensure_tz(datetime.fromisoformat(revised["end_iso"]))
         title = revised.get("title") or pending["title"]
         description = revised.get("description") or pending["description"]
+        recurrence_rule = pending.get("recurrence_rule")
 
-        await self._set_pending_confirmation(
-            message.from_user.id,
-            {
-                "mode": pending.get("mode", "create"),
-                "event_id": pending.get("event_id"),
-                "title": title,
-                "description": description,
-                "start_iso": start_at.isoformat(),
-                "end_iso": end_at.isoformat(),
-                "timezone": timezone,
-            },
-            session,
-        )
+        if pending.get("mode") == "create_recurring" and self._looks_like_recurring_request(text):
+            merged_text = (
+                f"{title} {text} в {self._format_time(start_at)} "
+                f"на {self._duration_minutes(start_at, end_at)} минут"
+            )
+            recurring = await self.parser.parse_recurring_request(merged_text)
+            if recurring.get("should_create") and recurring.get("recurrence_rule"):
+                recurrence_rule = recurring["recurrence_rule"]
+
+        updated_pending = {
+            "mode": pending.get("mode", "create"),
+            "event_id": pending.get("event_id"),
+            "title": title,
+            "description": description,
+            "start_iso": start_at.isoformat(),
+            "end_iso": end_at.isoformat(),
+            "timezone": timezone,
+        }
+        if recurrence_rule:
+            updated_pending["recurrence_rule"] = recurrence_rule
+
+        await self._set_pending_confirmation(message.from_user.id, updated_pending, session)
         reply = (
             "Обновил черновик:\n"
             f"• {escape(title)}\n"
             f"• {self._format_dt(start_at)} — {self._format_dt(end_at)}\n\n"
-            "Если все так, жми кнопку ниже."
+            + (
+                f"Повтор: {escape(self._humanize_rrule(recurrence_rule))}\n\n"
+                if pending.get("mode") == "create_recurring" and recurrence_rule
+                else ""
+            )
+            + "Если все так, жми кнопку ниже."
         )
         await message.answer(reply, reply_markup=self._confirm_keyboard())
         await self._remember(message.from_user.id, "assistant", f"Обновил черновик {title} на {self._format_dt(start_at)}.", session)
@@ -1760,7 +1778,12 @@ class TelegramBotService:
         access_token: str | None,
         session: AsyncSession,
     ) -> None:
-        parsed = await self.parser.parse_planning_request(text)
+        parsing_input = text
+        memory = await self._memory_prompt(message.from_user.id, session)
+        if memory:
+            parsing_input = f"Recent conversation:\n{memory}\n\nCurrent message:\n{text}"
+
+        parsed = await self.parser.parse_planning_request(parsing_input)
         if parsed.get("needs_clarification"):
             reply = parsed.get("clarification_question") or "Уточни, пожалуйста, в какие дни и с какого времени тебе искать слот."
             await message.answer(reply)
