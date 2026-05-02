@@ -102,6 +102,8 @@ class TaskParser:
                     f"Assume timezone {self.settings.default_timezone}. Current datetime is {now.isoformat()}. "
                     "Use Google Calendar RRULE format, for example RRULE:FREQ=WEEKLY;BYDAY=MO,WE or RRULE:FREQ=DAILY;BYDAY=MO,TU,WE,TH,FR. "
                     "Only set should_create=true when the user clearly asks for a repeating event like every Tuesday, every weekday, each Friday, weekly, or similar. "
+                    "If the user does not explicitly ask for repetition, set should_create=false and needs_clarification=false. "
+                    "Do not ask whether the event is one-time or recurring unless the user explicitly indicates repetition but leaves the pattern incomplete. "
                     "Always return explicit timezone offsets in start_iso and end_iso. "
                     "If the user asks for a non-recurring event, set should_create=false. "
                     "clarification_question must be short, friendly, and in Russian, addressing the user as 'ты'."

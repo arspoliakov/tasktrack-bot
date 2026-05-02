@@ -225,6 +225,29 @@ class TelegramBotService:
         return has_time_marker and has_event_hint
 
     @staticmethod
+    def _looks_like_recurring_request(text: str) -> bool:
+        cleaned = text.strip().lower()
+        recurrence_markers = (
+            "каждый ",
+            "каждую ",
+            "каждое ",
+            "по понедельникам",
+            "по вторникам",
+            "по средам",
+            "по четвергам",
+            "по пятницам",
+            "по субботам",
+            "по воскресеньям",
+            "каждый день",
+            "каждый будний день",
+            "ежедневно",
+            "еженедельно",
+            "повторя",
+            "регулярно",
+        )
+        return any(marker in cleaned for marker in recurrence_markers)
+
+    @staticmethod
     def _fast_intent(text: str) -> str | None:
         cleaned = text.strip().lower()
         if not cleaned:
@@ -2889,7 +2912,7 @@ class TelegramBotService:
     ) -> None:
         memory = await self._memory_prompt(message.from_user.id, session)
         parsing_input = text if not memory else f"Recent conversation:\n{memory}\n\nCurrent message:\n{text}"
-        if await self._process_recurring_request(message=message, text=parsing_input, session=session):
+        if self._looks_like_recurring_request(text) and await self._process_recurring_request(message=message, text=parsing_input, session=session):
             return
         parsed_multi = await self.parser.parse_events(parsing_input)
         if parsed_multi.get("needs_clarification"):
