@@ -159,8 +159,6 @@ class TelegramBotService:
     @staticmethod
     def _is_reaction(text: str) -> bool:
         cleaned = text.strip().lower()
-        if len(cleaned) <= 18:
-            return True
         reactions = (
             "и все",
             "и всё",
@@ -175,8 +173,12 @@ class TelegramBotService:
             "мда",
             "ну ок",
             "ясно",
+            "вау",
+            "ого",
+            "жесть",
+            "пон",
         )
-        return any(item in cleaned for item in reactions)
+        return cleaned in reactions or any(item == cleaned for item in reactions)
 
     @staticmethod
     def _is_undo_request(text: str) -> bool:
@@ -1473,15 +1475,15 @@ class TelegramBotService:
         refresh_token: str,
         session: AsyncSession,
     ) -> None:
-        if await self._contextual_reply(message, text, session):
-            return
-
         fast_intent = self._fast_intent(text)
         if fast_intent:
             intent = fast_intent
             logger.info("fast_intent_detected user=%s intent=%s text=%r", message.from_user.id, intent, text[:120])
             await self._log_usage(session, message.from_user.id, f"fast_intent:{intent}")
         else:
+            if await self._contextual_reply(message, text, session):
+                return
+
             routing_input = text
             memory = await self._memory_prompt(message.from_user.id, session)
             if memory:
