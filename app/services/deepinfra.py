@@ -57,7 +57,19 @@ class DeepInfraClient:
 
         content = data["choices"][0]["message"]["content"]
         if isinstance(content, str):
-            return json.loads(content)
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError as exc:
+                start = content.find("{")
+                end = content.rfind("}")
+                if start != -1 and end != -1 and end > start:
+                    candidate = content[start : end + 1]
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        pass
+                snippet = content[:300].replace("\n", " ").strip()
+                raise ValueError(f"DeepInfra returned invalid JSON: {snippet}") from exc
         return content
 
     async def chat_text(self, messages: list[dict[str, str]], temperature: float = 0.3) -> str:

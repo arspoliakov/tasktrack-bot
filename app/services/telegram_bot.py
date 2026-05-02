@@ -590,6 +590,100 @@ class TelegramBotService:
             return f"• {title}\n• {self._format_dt(start_at)} — {self._format_dt(end_at)}"
         return f"• {title}"
 
+    @staticmethod
+    def _humanize_rrule(rule: str) -> str:
+        if not rule:
+            return "повтор по расписанию"
+
+        normalized = rule.upper()
+        day_names = {
+            "MO": ("каждый понедельник", "понедельникам"),
+            "TU": ("каждый вторник", "вторникам"),
+            "WE": ("каждую среду", "средам"),
+            "TH": ("каждый четверг", "четвергам"),
+            "FR": ("каждую пятницу", "пятницам"),
+            "SA": ("каждую субботу", "субботам"),
+            "SU": ("каждое воскресенье", "воскресеньям"),
+        }
+
+        if "FREQ=DAILY" in normalized and "BYDAY=MO,TU,WE,TH,FR" in normalized:
+            return "каждый будний день"
+        if "FREQ=DAILY" in normalized:
+            return "каждый день"
+
+        byday_match = re.search(r"BYDAY=([A-Z,]+)", normalized)
+        byday_values = byday_match.group(1).split(",") if byday_match else []
+        named_days = [day_names.get(value, (value, value)) for value in byday_values]
+
+        if "FREQ=WEEKLY" in normalized and named_days:
+            if len(named_days) == 1:
+                return named_days[0][0]
+            return "каждую неделю по " + ", ".join(day[1] for day in named_days)
+
+        if "FREQ=MONTHLY" in normalized:
+            return "каждый месяц"
+        if "FREQ=YEARLY" in normalized:
+            return "каждый год"
+
+        return "повтор по расписанию"
+
+    @staticmethod
+    def _quick_cancel_parse(text: str, timezone: str) -> dict[str, Any] | None:
+        cleaned = (text or "").strip().lower()
+        if not cleaned:
+            return None
+        if not any(word in cleaned for word in ("отмени", "удали", "убери", "сними")):
+            return None
+
+        now = datetime.now(ZoneInfo(timezone))
+        search_until = now + timedelta(days=60)
+        title_query = cleaned
+        removable_phrases = (
+            "отмени",
+            "удали",
+            "убери",
+            "сними",
+            "каждый",
+            "каждую",
+            "каждое",
+            "ежедневно",
+            "еженедельно",
+            "повтор",
+            "повторение",
+            "по понедельникам",
+            "по вторникам",
+            "по средам",
+            "по четвергам",
+            "по пятницам",
+            "по субботам",
+            "по воскресеньям",
+        )
+        for phrase in removable_phrases:
+            title_query = title_query.replace(phrase, " ")
+        title_query = re.sub(r"\s+", " ", title_query).strip(" ,.-")
+        if not title_query:
+            return None
+
+        return {
+            "should_cancel": True,
+            "title_query": title_query,
+            "date_from_iso": now.isoformat(),
+            "date_to_iso": search_until.isoformat(),
+            "timezone": timezone,
+            "needs_clarification": False,
+            "clarification_question": "",
+        }
+
+    async def _reply_action_failed(self, message: Message, session: AsyncSession) -> None:
+        reply = "Что-то сбойнуло на моей стороне. Я ничего не создал и не изменил. Давай попробуем ещё раз."
+        await message.answer(reply)
+        await self._remember(message.from_user.id, "assistant", reply, session)
+
+    async def _reply_model_timeout(self, message: Message, session: AsyncSession) -> None:
+        reply = "Сейчас сеть или модель тупят дольше нормы. Я ничего не менял. Попробуй ещё раз через минуту."
+        await message.answer(reply)
+        await self._remember(message.from_user.id, "assistant", reply, session)
+
     def _free_windows_text(self, now: datetime, day_end: datetime, events: list[dict]) -> str:
         busy_ranges: list[tuple[datetime, datetime]] = []
         for event in events:
@@ -1756,7 +1850,7 @@ class TelegramBotService:
         reply = (
             "Понял так, создаем повторяющееся событие:\n"
             f"{self._describe_pending(pending)}\n"
-            f"Правило: <code>{escape(parsed['recurrence_rule'])}</code>\n\n"
+            f"Повтор: {escape(self._humanize_rrule(parsed['recurrence_rule']))}\n\n"
             "Если всё так, ответь «да» или жми кнопку."
         )
         await message.answer(reply, reply_markup=self._confirm_keyboard())
@@ -2127,13 +2221,20 @@ class TelegramBotService:
 
             text = message.text or ""
             await self._remember(message.from_user.id, "user", text, session)
-            await self._route_intent(
-                message=message,
-                text=text,
-                access_token=google_account.access_token,
-                refresh_token=google_account.refresh_token,
-                session=session,
-            )
+            try:
+                await self._route_intent(
+                    message=message,
+                    text=text,
+                    access_token=google_account.access_token,
+                    refresh_token=google_account.refresh_token,
+                    session=session,
+                )
+            except httpx.TimeoutException:
+                logger.exception("text_route_timeout user=%s", message.from_user.id)
+                await self._reply_model_timeout(message, session)
+            except Exception:
+                logger.exception("text_route_failed user=%s text=%r", message.from_user.id, text[:200])
+                await self._reply_action_failed(message, session)
 
     async def handle_voice(self, message: Message) -> None:
         async with self.session_factory() as session:
@@ -2143,18 +2244,25 @@ class TelegramBotService:
             google_account = await self._get_google_account(user.id, session)
 
             await message.answer("Сек, расшифровываю голосовое...")
-            file = await self.bot.get_file(message.voice.file_id)
-            file_bytes = await self.bot.download_file(file.file_path)
-            transcript = await self.deepinfra.transcribe("voice.ogg", file_bytes.read())
-            await message.answer(f"Вот что я услышал:\n<blockquote>{escape(transcript)}</blockquote>")
-            await self._remember(message.from_user.id, "user", transcript, session)
-            await self._route_intent(
-                message=message,
-                text=transcript,
-                access_token=google_account.access_token,
-                refresh_token=google_account.refresh_token,
-                session=session,
-            )
+            try:
+                file = await self.bot.get_file(message.voice.file_id)
+                file_bytes = await self.bot.download_file(file.file_path)
+                transcript = await self.deepinfra.transcribe("voice.ogg", file_bytes.read())
+                await message.answer(f"Вот что я услышал:\n<blockquote>{escape(transcript)}</blockquote>")
+                await self._remember(message.from_user.id, "user", transcript, session)
+                await self._route_intent(
+                    message=message,
+                    text=transcript,
+                    access_token=google_account.access_token,
+                    refresh_token=google_account.refresh_token,
+                    session=session,
+                )
+            except httpx.TimeoutException:
+                logger.exception("voice_route_timeout user=%s", message.from_user.id)
+                await self._reply_model_timeout(message, session)
+            except Exception:
+                logger.exception("voice_route_failed user=%s", message.from_user.id)
+                await self._reply_action_failed(message, session)
 
     async def handle_action_callback(self, callback: CallbackQuery, callback_data: ActionCallback) -> None:
         user_id = callback.from_user.id
@@ -3322,7 +3430,12 @@ class TelegramBotService:
         access_token: str | None,
         session: AsyncSession,
     ) -> None:
-        parsed = await self.parser.parse_cancel_request(text)
+        timezone = self.settings.default_timezone
+        parsed = None
+        if self._looks_like_recurring_request(text):
+            parsed = self._quick_cancel_parse(text, timezone)
+        if parsed is None:
+            parsed = await self.parser.parse_cancel_request(text)
         if parsed.get("needs_clarification"):
             reply = parsed.get("clarification_question") or "Уточни, какое именно событие убрать."
             await message.answer(reply)
