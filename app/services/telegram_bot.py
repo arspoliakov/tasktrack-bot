@@ -14,6 +14,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+import httpx
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -188,6 +189,63 @@ class TelegramBotService:
             "отмени последнее",
             "откати назад",
         }
+
+    @staticmethod
+    def _looks_like_create_event(text: str) -> bool:
+        cleaned = text.strip().lower()
+        time_words = (
+            "сегодня",
+            "завтра",
+            "послезавтра",
+            "в понедельник",
+            "во вторник",
+            "в среду",
+            "в четверг",
+            "в пятницу",
+            "в субботу",
+            "в воскресенье",
+            "через ",
+        )
+        verb_words = (
+            "созвон",
+            "встреч",
+            "зал",
+            "трен",
+            "стоматолог",
+            "универ",
+            "написать",
+            "сходить",
+            "создай",
+            "добавь",
+            "поставь",
+            "запланируй",
+        )
+        has_time_marker = bool(re.search(r"\b\d{1,2}:\d{2}\b", cleaned)) or any(word in cleaned for word in time_words)
+        has_event_hint = any(word in cleaned for word in verb_words)
+        return has_time_marker and has_event_hint
+
+    @staticmethod
+    def _fast_intent(text: str) -> str | None:
+        cleaned = text.strip().lower()
+        if not cleaned:
+            return None
+        if any(phrase in cleaned for phrase in ("что у меня сегодня", "что сегодня", "че сегодня", "чо сегодня", "че седня", "чек седня", "планы на сегодня")):
+            return "today_schedule"
+        if any(phrase in cleaned for phrase in ("что дальше", "что потом", "что сейчас", "что следующее", "что у меня дальше", "что у меня потом")):
+            return "next_event"
+        if any(phrase in cleaned for phrase in ("найди окно", "свободное время", "подбери время", "когда есть время", "куда влезет", "раскидай", "найди слот")):
+            return "plan_events"
+        if any(phrase in cleaned for phrase in ("напомни", "напомин")):
+            return "set_reminder"
+        if any(phrase in cleaned for phrase in ("перенеси", "сдвинь", "переименуй", "измени событие", "сделай на ")) and "последнее действие" not in cleaned:
+            return "update_event"
+        if any(phrase in cleaned for phrase in ("отмени", "удали", "убери", "сними")) and "последнее действие" not in cleaned:
+            return "cancel_event"
+        if TelegramBotService._looks_like_create_event(cleaned):
+            return "create_event"
+        if any(phrase in cleaned for phrase in ("что умеешь", "хелп", "help", "команды", "что ты умеешь")):
+            return "general_help"
+        return None
 
     @staticmethod
     def _loads_json(payload: str | None, default: Any) -> Any:
@@ -799,6 +857,14 @@ class TelegramBotService:
             timezone=self.settings.default_timezone,
             limit=20,
         )
+        events = [
+            event
+            for event in events
+            if (
+                (start := self.calendar_service.parse_event_datetime(event, self.settings.default_timezone, "start"))
+                and day_start <= start < day_end
+            )
+        ]
         if not events:
             reply = "На сегодня календарь пуст. Если хочешь, можем что-нибудь запланировать."
             await message.answer(reply)
@@ -831,6 +897,10 @@ class TelegramBotService:
             refresh_token=refresh_token,
             timezone=self.settings.default_timezone,
         )
+        if event:
+            event_end = self.calendar_service.parse_event_datetime(event, self.settings.default_timezone, "end")
+            if event_end and event_end <= now:
+                event = None
         if not event:
             reply = "Пока ничего ближайшего не вижу. Похоже, день свободный."
             await message.answer(reply)
@@ -1383,15 +1453,21 @@ class TelegramBotService:
         if await self._contextual_reply(message, text, session):
             return
 
-        routing_input = text
-        memory = await self._memory_prompt(message.from_user.id, session)
-        if memory:
-            routing_input = f"Recent conversation:\n{memory}\n\nCurrent message:\n{text}"
+        fast_intent = self._fast_intent(text)
+        if fast_intent:
+            intent = fast_intent
+            logger.info("fast_intent_detected user=%s intent=%s text=%r", message.from_user.id, intent, text[:120])
+            await self._log_usage(session, message.from_user.id, f"fast_intent:{intent}")
+        else:
+            routing_input = text
+            memory = await self._memory_prompt(message.from_user.id, session)
+            if memory:
+                routing_input = f"Recent conversation:\n{memory}\n\nCurrent message:\n{text}"
 
-        routing = await self.parser.classify_intent(routing_input)
-        intent = routing.get("intent", "other")
-        logger.info("intent_detected user=%s intent=%s text=%r", message.from_user.id, intent, text[:120])
-        await self._log_usage(session, message.from_user.id, f"intent:{intent}")
+            routing = await self.parser.classify_intent(routing_input)
+            intent = routing.get("intent", "other")
+            logger.info("intent_detected user=%s intent=%s text=%r", message.from_user.id, intent, text[:120])
+            await self._log_usage(session, message.from_user.id, f"intent:{intent}")
 
         if intent == "today_schedule":
             await self._answer_today_schedule(
@@ -1425,6 +1501,11 @@ class TelegramBotService:
             return
 
         if intent == "clarify":
+            routing_input = text
+            memory = await self._memory_prompt(message.from_user.id, session)
+            if memory:
+                routing_input = f"Recent conversation:\n{memory}\n\nCurrent message:\n{text}"
+            routing = await self.parser.classify_intent(routing_input)
             reply = routing.get("clarification_question") or "Не до конца понял. Ты хочешь создать событие или посмотреть расписание?"
             await message.answer(reply)
             await self._remember(message.from_user.id, "assistant", reply, session)

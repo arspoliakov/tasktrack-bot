@@ -25,12 +25,18 @@ async def lifespan(_: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
 
     polling_task = asyncio.create_task(bot_service.start())
+    reminder_task = asyncio.create_task(bot_service.run_reminder_loop())
     try:
         yield
     finally:
         polling_task.cancel()
+        reminder_task.cancel()
         try:
             await polling_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await reminder_task
         except asyncio.CancelledError:
             pass
         await bot_service.stop()

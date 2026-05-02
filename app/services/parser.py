@@ -22,11 +22,13 @@ class TaskParser:
                 "content": (
                     "You route Telegram calendar assistant messages. "
                     "Return only JSON with keys: intent, confidence, reply_style, clarification_question. "
-                    "Allowed intents: create_event, update_event, cancel_event, today_schedule, next_event, general_help, clarify, other. "
+                    "Allowed intents: create_event, update_event, cancel_event, plan_events, set_reminder, today_schedule, next_event, general_help, clarify, other. "
                     "reply_style must be one of: casual, neutral. "
                     "Use create_event when the user wants to add or plan a brand new calendar event. "
                     "Use update_event when the user wants to move, reschedule, rename, shorten, lengthen, or otherwise change an existing event. "
                     "Use cancel_event when the user wants to cancel, delete, remove, or drop an event from the calendar. "
+                    "Use plan_events when the user asks you to find free time, fit events into free slots, or arrange multiple items across days. "
+                    "Use set_reminder when the user asks to remind them about a specific event before it starts. "
                     "Use today_schedule when the user asks what is planned today. "
                     "Use next_event when the user asks what is next, what is happening now, or what comes after. "
                     "Use general_help when the user asks what the bot can do. "
@@ -35,6 +37,74 @@ class TaskParser:
                     "clarification_question must be empty unless intent=clarify. "
                     "If intent=clarify, clarification_question must be friendly, short, and in Russian, addressing the user as 'ты'. "
                     f"Current datetime is {now.isoformat()} in timezone {self.settings.default_timezone}."
+                ),
+            },
+            {"role": "user", "content": text},
+        ]
+        return await self.client.chat_json(messages)
+
+    async def parse_planning_request(self, text: str) -> dict[str, Any]:
+        now = datetime.now(self.timezone)
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You extract free-slot planning requests from Russian or English messages. "
+                    "Return only JSON with keys: should_plan(boolean), title(string), description(string), "
+                    "duration_minutes(integer), dates(array of ISO dates YYYY-MM-DD), "
+                    "day_parts(array of strings), earliest_time(string), latest_time(string), "
+                    "count(integer), timezone(string), needs_clarification(boolean), clarification_question(string). "
+                    f"Assume timezone {self.settings.default_timezone}. Current datetime is {now.isoformat()}. "
+                    "Use day_parts values only from: morning, afternoon, evening, night. "
+                    "If the user asks for Thursday and Friday evenings, include both dates and day_parts=['evening']. "
+                    "If earliest exact time is given, put it into earliest_time as HH:MM. "
+                    "If no latest_time is given, infer it from day_parts when possible. "
+                    "If the user says evening and gives no exact time, use needs_clarification=true unless you can still safely plan by asking a short follow-up. "
+                    "count is how many separate events the user wants to place. "
+                    "clarification_question must be short, friendly, and in Russian, addressing the user as 'ты'."
+                ),
+            },
+            {"role": "user", "content": text},
+        ]
+        return await self.client.chat_json(messages)
+
+    async def parse_reminder_request(self, text: str) -> dict[str, Any]:
+        now = datetime.now(self.timezone)
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You extract event reminder requests from Russian or English messages. "
+                    "Return only JSON with keys: should_set(boolean), title_query(string), "
+                    "search_from_iso(string), search_to_iso(string), minutes_before(integer), "
+                    "timezone(string), needs_clarification(boolean), clarification_question(string). "
+                    f"Assume timezone {self.settings.default_timezone}. Current datetime is {now.isoformat()}. "
+                    "Use minutes_before from phrases like 'за 10 минут', 'за час', 'за 30 минут'. "
+                    "Use search_from_iso/search_to_iso to narrow the target event window if user mentions today/tomorrow/day name. "
+                    "If the target event is unclear, set needs_clarification=true. "
+                    "clarification_question must be short, friendly, and in Russian, addressing the user as 'ты'."
+                ),
+            },
+            {"role": "user", "content": text},
+        ]
+        return await self.client.chat_json(messages)
+
+    async def parse_recurring_request(self, text: str) -> dict[str, Any]:
+        now = datetime.now(self.timezone)
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You extract recurring calendar event requests from Russian or English messages. "
+                    "Return only JSON with keys: should_create(boolean), title(string), description(string), "
+                    "start_iso(string), end_iso(string), timezone(string), recurrence_rule(string), "
+                    "needs_clarification(boolean), clarification_question(string). "
+                    f"Assume timezone {self.settings.default_timezone}. Current datetime is {now.isoformat()}. "
+                    "Use Google Calendar RRULE format, for example RRULE:FREQ=WEEKLY;BYDAY=MO,WE or RRULE:FREQ=DAILY;BYDAY=MO,TU,WE,TH,FR. "
+                    "Only set should_create=true when the user clearly asks for a repeating event like every Tuesday, every weekday, each Friday, weekly, or similar. "
+                    "Always return explicit timezone offsets in start_iso and end_iso. "
+                    "If the user asks for a non-recurring event, set should_create=false. "
+                    "clarification_question must be short, friendly, and in Russian, addressing the user as 'ты'."
                 ),
             },
             {"role": "user", "content": text},

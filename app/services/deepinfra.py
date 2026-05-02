@@ -12,6 +12,7 @@ class DeepInfraClient:
     def __init__(self) -> None:
         self.settings = get_settings()
         self.headers = {"Authorization": f"Bearer {self.settings.deepinfra_api_key}"}
+        self.chat_timeout = 45
 
     async def transcribe(self, filename: str, content: bytes) -> str:
         url = f"https://api.deepinfra.com/v1/inference/{self.settings.deepinfra_stt_model}"
@@ -49,7 +50,7 @@ class DeepInfraClient:
             "temperature": 0.1,
         }
 
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=self.chat_timeout) as client:
             response = await client.post(url, headers=self.headers, json=payload)
             response.raise_for_status()
             data = response.json()
@@ -67,7 +68,7 @@ class DeepInfraClient:
             "temperature": temperature,
         }
 
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=self.chat_timeout) as client:
             response = await client.post(url, headers=self.headers, json=payload)
             response.raise_for_status()
             data = response.json()
