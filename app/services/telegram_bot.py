@@ -19,7 +19,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
-from app.models import ConversationState, EventReminder, GoogleAccount, SelectionState, UndoAction, UsageEvent, User, UserPreference, UserStatus
+from app.models import ConversationState, EventReminder, GoogleAccount, SelectionState, TomorrowDigestDelivery, UndoAction, UsageEvent, User, UserPreference, UserStatus
 from app.security import StateSigner
 from app.services.deepinfra import DeepInfraClient
 from app.services.google_calendar import GoogleCalendarService
@@ -475,9 +475,73 @@ class TelegramBotService:
                         reminder.sent_at = now
                     if reminders:
                         await session.commit()
+                    await self._send_tomorrow_digests(session, now)
             except Exception:
                 logger.exception("reminder_loop_failed")
             await asyncio.sleep(30)
+
+    async def _send_tomorrow_digests(self, session: AsyncSession, now: datetime) -> None:
+        if now.hour != 21:
+            return
+
+        tomorrow = (now + timedelta(days=1)).date()
+        digest_date = tomorrow.isoformat()
+
+        result = await session.execute(
+            select(TomorrowDigestDelivery.user_id).where(TomorrowDigestDelivery.digest_for_date == digest_date)
+        )
+        already_sent = set(result.scalars().all())
+
+        result = await session.execute(
+            select(User, GoogleAccount)
+            .join(GoogleAccount, GoogleAccount.user_id == User.id)
+            .where(User.status.in_([UserStatus.APPROVED.value, UserStatus.ADMIN.value]), User.google_connected.is_(True))
+        )
+        recipients = result.all()
+
+        for user, google_account in recipients:
+            if user.id in already_sent:
+                continue
+
+            day_start = datetime.combine(tomorrow, datetime.min.time(), tzinfo=self._tz())
+            day_end = day_start + timedelta(days=1)
+            events = await self.calendar_service.list_events(
+                access_token=google_account.access_token,
+                refresh_token=google_account.refresh_token,
+                time_min=day_start,
+                time_max=day_end,
+                timezone=self.settings.default_timezone,
+                limit=20,
+            )
+            events = [
+                event
+                for event in events
+                if (
+                    (start := self.calendar_service.parse_event_datetime(event, self.settings.default_timezone, "start"))
+                    and day_start <= start < day_end
+                )
+            ]
+
+            if not events:
+                reply = f"Сводка на завтра, {tomorrow.strftime('%d.%m')}:\nПока пусто. Если хочешь, можем что-нибудь запланировать."
+            else:
+                lines = []
+                for event in events[:10]:
+                    start = self.calendar_service.parse_event_datetime(event, self.settings.default_timezone, "start")
+                    summary = escape(event.get("summary") or "Без названия")
+                    lines.append(f"• {start.strftime('%H:%M') if start else 'весь день'} — {summary}")
+                reply = f"Сводка на завтра, {tomorrow.strftime('%d.%m')}:\n" + "\n".join(lines)
+
+            await self.bot.send_message(user.telegram_id, reply)
+            session.add(
+                TomorrowDigestDelivery(
+                    user_id=user.id,
+                    telegram_id=user.telegram_id,
+                    digest_for_date=digest_date,
+                )
+            )
+
+        await session.commit()
 
     def _window_hours_for_day_parts(self, day_parts: list[str], earliest_time: str | None, latest_time: str | None) -> tuple[int, int]:
         if earliest_time and latest_time:

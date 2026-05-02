@@ -117,6 +117,17 @@ class EventReminder(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class TomorrowDigestDelivery(Base):
+    __tablename__ = "tomorrow_digest_deliveries"
+    __table_args__ = (UniqueConstraint("user_id", "digest_for_date", name="uq_tomorrow_digest_user_date"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    telegram_id: Mapped[int] = mapped_column(Integer, index=True)
+    digest_for_date: Mapped[str] = mapped_column(String(10), index=True)
+    sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class UndoAction(Base):
     __tablename__ = "undo_actions"
 
