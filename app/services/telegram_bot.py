@@ -210,6 +210,64 @@ class TelegramBotService:
                 return True
         return False
 
+    @staticmethod
+    def _extract_event_lookup_query(text: str) -> str | None:
+        lowered = (text or "").strip()
+        if not lowered:
+            return None
+
+        value = lowered
+        value = re.sub(r"^(а\s+)?(что\s+насчет|что\s+насчёт|что\s+по|а\s+что\s+по)\s+", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"\b(во\s+сколько|во\s+скоко|когда|на\s+когда)\b", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"\b(сегодня|завтра|послезавтра)\b", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"^(а\s+)", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"\s+", " ", value).strip(" ?!.,-")
+        return value or None
+
+    def _looks_like_event_lookup(self, text: str) -> bool:
+        cleaned = text.strip().lower()
+        if not cleaned:
+            return False
+        if any(phrase in cleaned for phrase in ("а потом", "что дальше", "что потом", "после этого", "до этого")):
+            return False
+        if re.search(r"\b(во\s+сколько|во\s+скоко|когда|на\s+когда)\b", cleaned):
+            return bool(self._extract_event_lookup_query(cleaned))
+        if cleaned.startswith("а "):
+            query = self._extract_event_lookup_query(cleaned)
+            if query and len(query.split()) <= 5:
+                return True
+        return False
+
+    def _extract_schedule_target_date(self, text: str, now: datetime) -> tuple[datetime, str]:
+        cleaned = (text or "").lower().replace("ё", "е")
+        if "послезавтра" in cleaned:
+            target = now + timedelta(days=2)
+            return target, "послезавтра"
+        if "завтра" in cleaned:
+            target = now + timedelta(days=1)
+            return target, "завтра"
+        if "сегодня" in cleaned or "седня" in cleaned:
+            return now, "сегодня"
+
+        weekday_forms = {
+            0: ("понедельник", "понедельника", "понедельникe", "понедельнику"),
+            1: ("вторник", "вторника", "вторнику"),
+            2: ("среду", "среда", "среды", "среде"),
+            3: ("четверг", "четверга", "четвергу"),
+            4: ("пятницу", "пятница", "пятницы", "пятнице"),
+            5: ("субботу", "суббота", "субботы", "субботе"),
+            6: ("воскресенье", "воскресенья", "воскресенью"),
+        }
+        for weekday, forms in weekday_forms.items():
+            if any(form in cleaned for form in forms):
+                days_ahead = (weekday - now.weekday()) % 7
+                if days_ahead == 0 and "на " in cleaned:
+                    days_ahead = 7
+                target = now + timedelta(days=days_ahead)
+                label = forms[0]
+                return target, label
+        return now, "сегодня"
+
     def _event_match_score(self, query: str, summary: str) -> float:
         normalized_query = self._normalize_event_text(query)
         normalized_summary = self._normalize_event_text(summary)
@@ -495,6 +553,9 @@ class TelegramBotService:
                 "че седня",
                 "чек седня",
                 "планы на сегодня",
+                "какие у меня планы",
+                "что у меня в",
+                "что у меня на",
                 "что по планам сегодня",
                 "что у меня на сегодня",
             ),
@@ -505,6 +566,7 @@ class TelegramBotService:
             (
                 "что дальше",
                 "что потом",
+                "а потом",
                 "что сейчас",
                 "что следующее",
                 "что у меня дальше",
@@ -1289,12 +1351,14 @@ class TelegramBotService:
         self,
         *,
         message: Message,
+        text: str | None = None,
         access_token: str | None,
         refresh_token: str,
         session: AsyncSession,
     ) -> None:
         now = datetime.now(self._tz())
-        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        target_day, target_label = self._extract_schedule_target_date(text or "", now)
+        day_start = target_day.replace(hour=0, minute=0, second=0, microsecond=0)
         day_end = day_start + timedelta(days=1)
         events = await self.calendar_service.list_events(
             access_token=access_token,
@@ -1313,7 +1377,7 @@ class TelegramBotService:
             )
         ]
         if not events:
-            reply = "На сегодня календарь пуст. Если хочешь, можем что-нибудь запланировать."
+            reply = f"На {target_label} календарь пуст. Если хочешь, можем что-нибудь запланировать."
             await message.answer(reply)
             await self._remember(message.from_user.id, "assistant", reply, session)
             return
@@ -1323,12 +1387,67 @@ class TelegramBotService:
             start = self.calendar_service.parse_event_datetime(event, self.settings.default_timezone, "start")
             summary = escape(event.get("summary") or "Без названия")
             lines.append(f"{start.strftime('%H:%M') if start else 'весь день'} — {summary}")
-        free_windows = self._free_windows_text(now, day_end, events)
-        prefix = f"На сегодня у тебя {len(events)} {'событие' if len(events) == 1 else 'события' if 2 <= len(events) <= 4 else 'событий'}:\n"
-        suffix = f"\n\nСвободные окна дальше сегодня: {free_windows}" if free_windows else ""
+        free_windows = self._free_windows_text(max(now, day_start), day_end, events)
+        prefix = f"На {target_label} у тебя {len(events)} {'событие' if len(events) == 1 else 'события' if 2 <= len(events) <= 4 else 'событий'}:\n"
+        suffix = f"\n\nСвободные окна дальше {target_label}: {free_windows}" if free_windows and target_day.date() >= now.date() else ""
         reply = prefix + "\n".join(lines) + suffix
         await message.answer(reply)
         await self._remember(message.from_user.id, "assistant", reply, session)
+
+    async def _answer_event_lookup(
+        self,
+        *,
+        message: Message,
+        text: str,
+        access_token: str | None,
+        refresh_token: str,
+        session: AsyncSession,
+    ) -> bool:
+        query = self._extract_event_lookup_query(text)
+        if not query:
+            return False
+
+        now = datetime.now(self._tz())
+        target_day, _ = self._extract_schedule_target_date(text, now)
+        time_min = target_day.replace(hour=0, minute=0, second=0, microsecond=0)
+        time_max = time_min + timedelta(days=1)
+        events = await self.calendar_service.list_events(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            time_min=time_min,
+            time_max=time_max,
+            timezone=self.settings.default_timezone,
+            limit=30,
+        )
+        matches = self._filter_matching_events(events, query)
+        if not matches:
+            search_start = now - timedelta(days=1)
+            search_end = now + timedelta(days=14)
+            events = await self.calendar_service.list_events(
+                access_token=access_token,
+                refresh_token=refresh_token,
+                time_min=search_start,
+                time_max=search_end,
+                timezone=self.settings.default_timezone,
+                limit=50,
+            )
+            matches = self._filter_matching_events(events, query)
+        if not matches:
+            return False
+
+        event = matches[0]
+        start = self.calendar_service.parse_event_datetime(event, self.settings.default_timezone, "start")
+        end = self.calendar_service.parse_event_datetime(event, self.settings.default_timezone, "end")
+        summary = escape(event.get("summary") or "Событие")
+        if start and end:
+            reply = f"«{summary}» у тебя {start.strftime('%d.%m')} с {start.strftime('%H:%M')} до {end.strftime('%H:%M')}."
+        elif start:
+            reply = f"«{summary}» у тебя {start.strftime('%d.%m')} в {start.strftime('%H:%M')}."
+        else:
+            reply = f"Нашел событие «{summary}», но время у него не смог нормально прочитать."
+        await message.answer(reply)
+        await self._remember(message.from_user.id, "assistant", reply, session)
+        return True
 
     async def _answer_next_event(
         self,
@@ -1450,12 +1569,21 @@ class TelegramBotService:
             limit=2,
         )
         follow_up = ""
-        if len(after_events) > 1:
-            after_next = after_events[1]
-            after_next_start = self.calendar_service.parse_event_datetime(after_next, self.settings.default_timezone, "start")
-            after_next_summary = escape(after_next.get("summary") or "что-то еще")
-            if after_next_start:
-                follow_up = f" Потом еще «{after_next_summary}» в {self._format_time(after_next_start)}."
+        if after_events:
+            after_next = after_events[0]
+            after_next_end = self.calendar_service.parse_event_datetime(after_next, self.settings.default_timezone, "end")
+            current_event_id = event.get("id")
+            if current_event_id and after_next.get("id") == current_event_id and len(after_events) > 1:
+                after_next = after_events[1]
+            elif current_event_id and after_next.get("id") == current_event_id:
+                after_next = None
+            elif after_next_end and after_next_end <= (end or now):
+                after_next = after_events[1] if len(after_events) > 1 else None
+            if after_next:
+                after_next_start = self.calendar_service.parse_event_datetime(after_next, self.settings.default_timezone, "start")
+                after_next_summary = escape(after_next.get("summary") or "что-то еще")
+                if after_next_start:
+                    follow_up = f" Потом еще «{after_next_summary}» в {self._format_time(after_next_start)}."
 
         if start and end and start <= now <= end:
             reply = f"Сейчас у тебя идет «{summary}» до {end.strftime('%H:%M')}.{follow_up}"
@@ -2106,11 +2234,22 @@ class TelegramBotService:
         if intent == "today_schedule":
             await self._answer_today_schedule(
                 message=message,
+                text=text,
                 access_token=access_token,
                 refresh_token=refresh_token,
                 session=session,
             )
             return
+
+        if self._looks_like_event_lookup(text):
+            if await self._answer_event_lookup(
+                message=message,
+                text=text,
+                access_token=access_token,
+                refresh_token=refresh_token,
+                session=session,
+            ):
+                return
 
         if intent == "next_event":
             await self._answer_next_event(
