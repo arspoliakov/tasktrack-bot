@@ -279,6 +279,39 @@ class TelegramBotService:
             return True
         return any(marker in cleaned for marker in calendar_markers)
 
+    def _looks_like_schedule_query(self, text: str) -> bool:
+        cleaned = text.strip().lower().replace("ё", "е")
+        if not cleaned:
+            return False
+        schedule_question_markers = (
+            "что у меня",
+            "какие у меня планы",
+            "что по планам",
+            "планы на",
+            "планы у меня",
+            "а сегодня что",
+            "а завтра что",
+            "сегодня что",
+            "завтра что",
+            "послезавтра что",
+            "че сегодня",
+            "чо сегодня",
+            "че седня",
+            "чек седня",
+        )
+        if any(marker in cleaned for marker in schedule_question_markers):
+            return True
+        if re.search(r"\b(сегодня|завтра|послезавтра|пятниц\w*|четверг\w*|суббот\w*|воскресен\w*|понедель\w*|вторник\w*|сред\w*)\b", cleaned):
+            if "что" in cleaned or "планы" in cleaned:
+                return True
+        if re.search(r"\b\d{1,2}\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\b", cleaned):
+            if "что" in cleaned or "планы" in cleaned:
+                return True
+        if re.search(r"\b(первого|второго|третьего|четвертого|четвёртого|пятого|шестого|седьмого|восьмого|девятого|десятого|одиннадцатого|двенадцатого|тринадцатого|четырнадцатого|пятнадцатого|шестнадцатого|семнадцатого|восемнадцатого|девятнадцатого|двадцатого|двадцать первого|двадцать второго|двадцать третьего|двадцать четвертого|двадцать четвёртого|двадцать пятого|двадцать шестого|двадцать седьмого|двадцать восьмого|двадцать девятого|тридцатого|тридцать первого)\b", cleaned):
+            if "что" in cleaned or "планы" in cleaned:
+                return True
+        return False
+
     def _extract_schedule_target_date(self, text: str, now: datetime) -> tuple[datetime, str]:
         cleaned = (text or "").lower().replace("ё", "е")
         month_names = {
@@ -572,6 +605,8 @@ class TelegramBotService:
     @staticmethod
     def _looks_like_create_event(text: str) -> bool:
         cleaned = text.strip().lower()
+        if "?" in cleaned or "что " in cleaned or cleaned.endswith(" что") or "какие планы" in cleaned or "планы на" in cleaned:
+            return False
         time_words = (
             "сегодня",
             "завтра",
@@ -593,6 +628,7 @@ class TelegramBotService:
             "зал",
             "трен",
             "стоматолог",
+            "венеролог",
             "универ",
             "написать",
             "сходить",
@@ -613,7 +649,11 @@ class TelegramBotService:
             or any(word in cleaned for word in time_words)
         )
         has_event_hint = any(word in cleaned for word in verb_words)
-        return has_time_marker and (has_event_hint or len(cleaned.split()) <= 8)
+        has_exact_datetime_pattern = bool(
+            re.search(r"\b\d{1,2}\s+ма[йя]\b", cleaned) and re.search(r"\b\d{1,2}[:.]\d{2}\b", cleaned)
+        )
+        trailing_subject = len(cleaned.split()) >= 4 and not any(word in cleaned for word in ("что", "какие планы", "планы на"))
+        return has_time_marker and (has_event_hint or (has_exact_datetime_pattern and trailing_subject))
 
     def _looks_like_recurring_request(self, text: str) -> bool:
         cleaned = text.strip().lower()
@@ -654,29 +694,7 @@ class TelegramBotService:
         cleaned = text.strip().lower()
         if not cleaned:
             return None
-        if self._contains_phrase(
-            cleaned,
-            (
-                "что у меня сегодня",
-                "что сегодня",
-                "че сегодня",
-                "чо сегодня",
-                "че седня",
-                "чек седня",
-                "планы на сегодня",
-                "какие у меня планы",
-                "что у меня в",
-                "что у меня на",
-                "что по планам сегодня",
-                "что у меня на сегодня",
-            ),
-        ) or (
-            ("что у меня" in cleaned or "какие у меня планы" in cleaned or "планы у меня" in cleaned or "а что у меня" in cleaned)
-            and (
-                re.search(r"\b\d{1,2}\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\b", cleaned)
-                or re.search(r"\b(первого|второго|третьего|четвертого|четвёртого|пятого|шестого|седьмого|восьмого|девятого|десятого|одиннадцатого|двенадцатого|тринадцатого|четырнадцатого|пятнадцатого|шестнадцатого|семнадцатого|восемнадцатого|девятнадцатого|двадцатого|двадцать первого|двадцать второго|двадцать третьего|двадцать четвертого|двадцать четвёртого|двадцать пятого|двадцать шестого|двадцать седьмого|двадцать восьмого|двадцать девятого|тридцатого|тридцать первого)\b", cleaned)
-            )
-        ):
+        if self._looks_like_schedule_query(cleaned):
             return "today_schedule"
         if self._contains_phrase(
             cleaned,
