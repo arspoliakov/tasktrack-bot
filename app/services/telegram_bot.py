@@ -238,8 +238,119 @@ class TelegramBotService:
                 return True
         return False
 
+    def _looks_calendarish(self, text: str) -> bool:
+        cleaned = text.strip().lower().replace("ё", "е")
+        if not cleaned:
+            return False
+        calendar_markers = (
+            "сегодня",
+            "завтра",
+            "послезавтра",
+            "пятниц",
+            "четверг",
+            "суббот",
+            "воскресен",
+            "понедель",
+            "вторник",
+            "сред",
+            "календар",
+            "встреч",
+            "созвон",
+            "событ",
+            "напом",
+            "перенес",
+            "перенеси",
+            "отмени",
+            "удали",
+            "убери",
+            "зал",
+            "универ",
+            "трен",
+            "окно",
+            "свободн",
+            "во сколько",
+            "когда",
+            "после ",
+            "до ",
+        )
+        if re.search(r"\b\d{1,2}[:.]\d{2}\b", cleaned):
+            return True
+        if re.search(r"\b\d{1,2}\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\b", cleaned):
+            return True
+        return any(marker in cleaned for marker in calendar_markers)
+
     def _extract_schedule_target_date(self, text: str, now: datetime) -> tuple[datetime, str]:
         cleaned = (text or "").lower().replace("ё", "е")
+        month_names = {
+            "января": 1,
+            "февраля": 2,
+            "марта": 3,
+            "апреля": 4,
+            "мая": 5,
+            "июня": 6,
+            "июля": 7,
+            "августа": 8,
+            "сентября": 9,
+            "октября": 10,
+            "ноября": 11,
+            "декабря": 12,
+        }
+        ordinal_days = {
+            "первого": 1,
+            "второго": 2,
+            "третьего": 3,
+            "четвертого": 4,
+            "четвёртого": 4,
+            "пятого": 5,
+            "шестого": 6,
+            "седьмого": 7,
+            "восьмого": 8,
+            "девятого": 9,
+            "десятого": 10,
+            "одиннадцатого": 11,
+            "двенадцатого": 12,
+            "тринадцатого": 13,
+            "четырнадцатого": 14,
+            "пятнадцатого": 15,
+            "шестнадцатого": 16,
+            "семнадцатого": 17,
+            "восемнадцатого": 18,
+            "девятнадцатого": 19,
+            "двадцатого": 20,
+            "двадцать первого": 21,
+            "двадцать второго": 22,
+            "двадцать третьего": 23,
+            "двадцать четвертого": 24,
+            "двадцать четвёртого": 24,
+            "двадцать пятого": 25,
+            "двадцать шестого": 26,
+            "двадцать седьмого": 27,
+            "двадцать восьмого": 28,
+            "двадцать девятого": 29,
+            "тридцатого": 30,
+            "тридцать первого": 31,
+        }
+
+        exact_date_match = re.search(r"\b(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\b", cleaned)
+        if exact_date_match:
+            day = int(exact_date_match.group(1))
+            month = month_names[exact_date_match.group(2)]
+            year = now.year + (1 if month < now.month or (month == now.month and day < now.day) else 0)
+            target = now.replace(year=year, month=month, day=day)
+            return target, f"{day:02d}.{month:02d}"
+
+        for phrase, day in sorted(ordinal_days.items(), key=lambda item: len(item[0]), reverse=True):
+            if re.search(rf"\b{re.escape(phrase)}\b", cleaned):
+                month = now.month
+                year = now.year
+                if day < now.day:
+                    month += 1
+                    if month == 13:
+                        month = 1
+                        year += 1
+                target = now.replace(year=year, month=month, day=day)
+                return target, f"{day:02d}.{month:02d}"
+
         if "послезавтра" in cleaned:
             target = now + timedelta(days=2)
             return target, "послезавтра"
@@ -559,6 +670,12 @@ class TelegramBotService:
                 "что по планам сегодня",
                 "что у меня на сегодня",
             ),
+        ) or (
+            ("что у меня" in cleaned or "какие у меня планы" in cleaned or "планы у меня" in cleaned or "а что у меня" in cleaned)
+            and (
+                re.search(r"\b\d{1,2}\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\b", cleaned)
+                or re.search(r"\b(первого|второго|третьего|четвертого|четвёртого|пятого|шестого|седьмого|восьмого|девятого|десятого|одиннадцатого|двенадцатого|тринадцатого|четырнадцатого|пятнадцатого|шестнадцатого|семнадцатого|восемнадцатого|девятнадцатого|двадцатого|двадцать первого|двадцать второго|двадцать третьего|двадцать четвертого|двадцать четвёртого|двадцать пятого|двадцать шестого|двадцать седьмого|двадцать восьмого|двадцать девятого|тридцатого|тридцать первого)\b", cleaned)
+            )
         ):
             return "today_schedule"
         if self._contains_phrase(
@@ -2346,15 +2463,34 @@ class TelegramBotService:
         await self._friendly_fallback(message, text, session)
 
     async def _friendly_fallback(self, message: Message, text: str, session: AsyncSession) -> None:
-        reply = (
-            "Не до конца понял запрос. Я лучше работаю, когда ты пишешь прямо по делу.\n"
-            "Например:\n"
-            "• созвон завтра в 15:00 на час\n"
-            "• что у меня сегодня\n"
-            "• что дальше\n"
-            "• перенеси созвон с Колей на 16:00\n"
-            "• отмени тренировку в пятницу"
-        )
+        if self._looks_calendarish(text):
+            reply = (
+                "Не до конца понял запрос по календарю.\n"
+                "Попробуй короче и конкретнее. Например:\n"
+                "• созвон завтра в 15:00 на час\n"
+                "• что у меня сегодня\n"
+                "• что дальше\n"
+                "• перенеси созвон с Колей на 16:00\n"
+                "• отмени тренировку в пятницу"
+            )
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
+            return
+
+        prompt = [
+            {
+                "role": "system",
+                "content": (
+                    "Ты дружелюбный русскоязычный ассистент в Telegram. "
+                    "Сейчас пользователь пишет не про календарное действие, а просто общается. "
+                    "Ответь коротко, естественно, на ты, без официоза и без перечисления команд. "
+                    "Не выдумывай факты, не упоминай календарь без причины, не уходи в длинные советы. "
+                    "Если пользователь ругается или троллит, отвечай спокойно и по-человечески."
+                ),
+            },
+            {"role": "user", "content": text},
+        ]
+        reply = await self.deepinfra.chat_text(prompt, temperature=0.6)
         await message.answer(reply)
         await self._remember(message.from_user.id, "assistant", reply, session)
 
