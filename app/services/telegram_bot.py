@@ -117,6 +117,94 @@ class TelegramBotService:
         prefix_bonus = 0.15 if len(prefix) == 3 and normalized_summary.startswith(prefix) else 0.0
         return max(similarity, token_score + prefix_bonus)
 
+    @staticmethod
+    def _extract_after_event_query(text: str) -> str | None:
+        lowered = (text or "").strip()
+        if not lowered:
+            return None
+
+        quoted_match = re.search(r'после\s+["«](.+?)["»]', lowered, re.IGNORECASE)
+        if quoted_match:
+            return quoted_match.group(1).strip()
+
+        match = re.search(r"после\s+(.+)", lowered, re.IGNORECASE)
+        if not match:
+            return None
+
+        value = match.group(1).strip()
+        value = re.sub(r"^(этой|этого|этот)\s+", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"\b(сегодня|завтра|днем|днём|вечером|ночью|утром)\b", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"\s+", " ", value).strip(" ,.-")
+        return value or None
+
+    @staticmethod
+    def _extract_before_event_query(text: str) -> str | None:
+        lowered = (text or "").strip()
+        if not lowered:
+            return None
+
+        quoted_match = re.search(r'до\s+["«](.+?)["»]', lowered, re.IGNORECASE)
+        if quoted_match:
+            return quoted_match.group(1).strip()
+
+        match = re.search(r"до\s+(.+)", lowered, re.IGNORECASE)
+        if not match:
+            return None
+
+        value = match.group(1).strip()
+        value = re.sub(r"^(этой|этого|этот)\s+", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"\b(сегодня|завтра|днем|днём|вечером|ночью|утром)\b", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"\s+", " ", value).strip(" ,.-")
+        return value or None
+
+    async def _resolve_relative_reference_from_calendar(
+        self,
+        *,
+        text: str,
+        base_start: datetime,
+        base_end: datetime,
+        access_token: str | None,
+        refresh_token: str,
+        timezone: str,
+    ) -> tuple[datetime, datetime] | None:
+        relation = None
+        query = self._extract_after_event_query(text)
+        if query:
+            relation = "after"
+        else:
+            query = self._extract_before_event_query(text)
+            if query:
+                relation = "before"
+        if not relation or not query:
+            return None
+
+        duration = base_end - base_start
+        day_start = base_start.astimezone(self._tz()).replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(days=1)
+        events = await self.calendar_service.list_events(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            time_min=day_start,
+            time_max=day_end,
+            timezone=timezone,
+            limit=30,
+        )
+        matches = self._filter_matching_events(events, query)
+        if not matches:
+            return None
+
+        anchor = matches[0]
+        if relation == "after":
+            anchor_point = self.calendar_service.parse_event_datetime(anchor, timezone, "end")
+            if not anchor_point:
+                return None
+            return anchor_point, anchor_point + duration
+
+        anchor_point = self.calendar_service.parse_event_datetime(anchor, timezone, "start")
+        if not anchor_point:
+            return None
+        return anchor_point - duration, anchor_point
+
     def _filter_matching_events(self, events: list[dict], title_query: str) -> list[dict]:
         if not title_query:
             return events
@@ -1073,22 +1161,62 @@ class TelegramBotService:
         self,
         *,
         message: Message,
+        text: str | None = None,
         access_token: str | None,
         refresh_token: str,
         session: AsyncSession,
     ) -> None:
         now = datetime.now(self._tz())
-        event = await self.calendar_service.get_next_event(
-            access_token=access_token,
-            refresh_token=refresh_token,
-            timezone=self.settings.default_timezone,
-        )
+        anchor_query = self._extract_after_event_query(text or "") if text else None
+        if anchor_query:
+            search_start = now - timedelta(days=1)
+            search_end = now + timedelta(days=14)
+            events = await self.calendar_service.list_events(
+                access_token=access_token,
+                refresh_token=refresh_token,
+                time_min=search_start,
+                time_max=search_end,
+                timezone=self.settings.default_timezone,
+                limit=50,
+            )
+            matches = self._filter_matching_events(events, anchor_query)
+            if not matches:
+                reply = f"Не нашел в календаре событие «{escape(anchor_query)}». Напиши название чуть точнее."
+                await message.answer(reply)
+                await self._remember(message.from_user.id, "assistant", reply, session)
+                return
+            anchor_event = matches[0]
+            anchor_end = self.calendar_service.parse_event_datetime(anchor_event, self.settings.default_timezone, "end")
+            if not anchor_end:
+                reply = f"У события «{escape(anchor_event.get('summary') or anchor_query)}» не получилось прочитать время окончания."
+                await message.answer(reply)
+                await self._remember(message.from_user.id, "assistant", reply, session)
+                return
+            next_events = await self.calendar_service.list_events(
+                access_token=access_token,
+                refresh_token=refresh_token,
+                time_min=anchor_end,
+                time_max=anchor_end + timedelta(days=7),
+                timezone=self.settings.default_timezone,
+                limit=2,
+            )
+            event = next_events[0] if next_events else None
+        else:
+            event = await self.calendar_service.get_next_event(
+                access_token=access_token,
+                refresh_token=refresh_token,
+                timezone=self.settings.default_timezone,
+            )
         if event:
             event_end = self.calendar_service.parse_event_datetime(event, self.settings.default_timezone, "end")
             if event_end and event_end <= now:
                 event = None
         if not event:
-            reply = "Пока ничего ближайшего не вижу. Похоже, день свободный."
+            reply = (
+                f"После этого события дальше пока ничего не вижу."
+                if anchor_query
+                else "Пока ничего ближайшего не вижу. Похоже, день свободный."
+            )
             await message.answer(reply)
             await self._remember(message.from_user.id, "assistant", reply, session)
             return
@@ -1116,14 +1244,16 @@ class TelegramBotService:
             reply = f"Сейчас у тебя идет «{summary}» до {end.strftime('%H:%M')}.{follow_up}"
             markup = None
         elif start:
-            reply = f"Дальше у тебя «{summary}» в {self._format_dt(start)}.{follow_up}"
+            prefix = "После этого у тебя" if anchor_query else "Дальше у тебя"
+            reply = f"{prefix} «{summary}» в {self._format_dt(start)}.{follow_up}"
             minutes_until = int((start - now).total_seconds() // 60)
             markup = self._next_event_keyboard(
                 can_remind_10=minutes_until > 10,
                 can_remind_60=minutes_until > 60,
             )
         else:
-            reply = f"Дальше у тебя событие «{summary}»."
+            prefix = "После этого у тебя" if anchor_query else "Дальше у тебя"
+            reply = f"{prefix} событие «{summary}»."
             markup = None
         await message.answer(reply, reply_markup=markup)
         await self._remember(message.from_user.id, "assistant", reply, session)
@@ -1516,6 +1646,8 @@ class TelegramBotService:
         self,
         *,
         message: Message,
+        access_token: str | None,
+        refresh_token: str,
         session: AsyncSession,
     ) -> bool:
         pending = await self._get_pending_confirmation(message.from_user.id, session)
@@ -1527,6 +1659,60 @@ class TelegramBotService:
         text = (message.text or "").strip()
         if not text or self._is_yes(text) or self._is_no(text):
             return False
+
+        after_event_query = self._extract_after_event_query(text)
+        before_event_query = self._extract_before_event_query(text)
+        if after_event_query or before_event_query:
+            timezone = pending.get("timezone") or self.settings.default_timezone
+            pending_start = self._ensure_tz(datetime.fromisoformat(pending["start_iso"]))
+            pending_end = self._ensure_tz(datetime.fromisoformat(pending["end_iso"]))
+            resolved = await self._resolve_relative_reference_from_calendar(
+                text=text,
+                base_start=pending_start,
+                base_end=pending_end,
+                access_token=access_token,
+                refresh_token=refresh_token,
+                timezone=timezone,
+            )
+            if resolved:
+                start_at, end_at = resolved
+                updated_pending = {
+                    "mode": pending.get("mode", "create"),
+                    "event_id": pending.get("event_id"),
+                    "title": pending["title"],
+                    "description": pending["description"],
+                    "start_iso": start_at.isoformat(),
+                    "end_iso": end_at.isoformat(),
+                    "timezone": timezone,
+                }
+                if pending.get("recurrence_rule"):
+                    updated_pending["recurrence_rule"] = pending["recurrence_rule"]
+                await self._set_pending_confirmation(message.from_user.id, updated_pending, session)
+                reply = (
+                    "Обновил черновик:\n"
+                    f"• {escape(pending['title'])}\n"
+                    f"• {self._format_dt(start_at)} — {self._format_dt(end_at)}\n\n"
+                    + (
+                        f"Повтор: {escape(self._humanize_rrule(pending['recurrence_rule']))}\n\n"
+                        if pending.get("mode") == "create_recurring" and pending.get("recurrence_rule")
+                        else ""
+                    )
+                    + "Если все так, жми кнопку ниже."
+                )
+                await message.answer(reply, reply_markup=self._confirm_keyboard())
+                await self._remember(
+                    message.from_user.id,
+                    "assistant",
+                    f"Привязал черновик к событию из календаря: {after_event_query or before_event_query}.",
+                    session,
+                )
+                return True
+
+            relation_label = "после" if after_event_query else "до"
+            reply = f"Не нашел в календаре событие, {relation_label} которого ты хочешь это поставить. Напиши точнее его название."
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
+            return True
 
         revised = await self.parser.revise_event_draft(
             draft_title=pending["title"],
@@ -1723,6 +1909,7 @@ class TelegramBotService:
         if intent == "next_event":
             await self._answer_next_event(
                 message=message,
+                text=text,
                 access_token=access_token,
                 refresh_token=refresh_token,
                 session=session,
@@ -2341,7 +2528,12 @@ class TelegramBotService:
             ):
                 return
 
-            if await self._handle_pending_confirmation_update(message=message, session=session):
+            if await self._handle_pending_confirmation_update(
+                message=message,
+                access_token=google_account.access_token,
+                refresh_token=google_account.refresh_token,
+                session=session,
+            ):
                 return
 
             if await self._handle_pending_state_clarification(message, session):
@@ -3230,6 +3422,23 @@ class TelegramBotService:
         timezone = parsed.get("timezone") or self.settings.default_timezone
         start_at = self._ensure_tz(datetime.fromisoformat(parsed["start_iso"]))
         end_at = self._ensure_tz(datetime.fromisoformat(parsed["end_iso"]))
+        resolved_relative = await self._resolve_relative_reference_from_calendar(
+            text=text,
+            base_start=start_at,
+            base_end=end_at,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            timezone=timezone,
+        )
+        if resolved_relative:
+            start_at, end_at = resolved_relative
+        elif self._extract_after_event_query(text) or self._extract_before_event_query(text):
+            relation_label = "после" if self._extract_after_event_query(text) else "до"
+            reply = f"Я не нашел в календаре событие, {relation_label} которого ты хочешь это поставить. Напиши его название точнее."
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
+            return
+
         conflicts = await self.calendar_service.find_conflicts(
             access_token=access_token,
             refresh_token=refresh_token,
