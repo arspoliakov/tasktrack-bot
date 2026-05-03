@@ -89,17 +89,126 @@ class TelegramBotService:
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         aliases = {
             "уник": "универ",
+            "уника": "универ",
+            "унику": "универ",
+            "уником": "универ",
             "универ": "универ",
+            "универа": "универ",
+            "универу": "универ",
             "универс": "универ",
+            "университет": "универ",
             "качалка": "зал",
+            "качалку": "зал",
+            "качалке": "зал",
             "зал": "зал",
+            "зала": "зал",
+            "зале": "зал",
             "треня": "тренировка",
             "тренька": "тренировка",
+            "треню": "тренировка",
+            "тренировка": "тренировка",
+            "тренировки": "тренировка",
             "созвон": "созвон",
+            "созвона": "созвон",
+            "созвону": "созвон",
             "кол": "коля",
+            "колей": "коля",
+            "колю": "коля",
+            "прогулка": "гулять",
+            "прогулку": "гулять",
+            "прогулки": "гулять",
+            "погулять": "гулять",
+            "погуляю": "гулять",
+            "гулять": "гулять",
+            "выставка": "выставка",
+            "выставки": "выставка",
+            "выставку": "выставка",
         }
-        tokens = [aliases.get(token, token) for token in cleaned.split()]
+        suffixes = (
+            "иями",
+            "ями",
+            "ами",
+            "иях",
+            "ях",
+            "ого",
+            "ему",
+            "ому",
+            "ыми",
+            "ими",
+            "его",
+            "ая",
+            "яя",
+            "ой",
+            "ей",
+            "ий",
+            "ый",
+            "ое",
+            "ее",
+            "ам",
+            "ям",
+            "ах",
+            "ях",
+            "ом",
+            "ем",
+            "ов",
+            "ев",
+            "ы",
+            "и",
+            "а",
+            "я",
+            "е",
+            "у",
+            "ю",
+            "о",
+        )
+        tokens: list[str] = []
+        for raw_token in cleaned.split():
+            token = aliases.get(raw_token, raw_token)
+            if token == raw_token and len(token) >= 5:
+                for suffix in suffixes:
+                    if token.endswith(suffix) and len(token) - len(suffix) >= 4:
+                        token = token[: -len(suffix)]
+                        break
+            token = aliases.get(token, token)
+            tokens.append(token)
         return " ".join(tokens)
+
+    def _phrase_similarity(self, left: str, right: str) -> float:
+        normalized_left = self._normalize_event_text(left)
+        normalized_right = self._normalize_event_text(right)
+        if not normalized_left or not normalized_right:
+            return 0.0
+        if normalized_left == normalized_right:
+            return 1.0
+        return SequenceMatcher(None, normalized_left, normalized_right).ratio()
+
+    def _contains_phrase(self, text: str, phrases: tuple[str, ...], threshold: float = 0.84) -> bool:
+        normalized_text = self._normalize_event_text(text)
+        if not normalized_text:
+            return False
+        text_tokens = normalized_text.split()
+        joined = " ".join(text_tokens)
+        for phrase in phrases:
+            normalized_phrase = self._normalize_event_text(phrase)
+            if not normalized_phrase:
+                continue
+            if normalized_phrase in joined:
+                return True
+            phrase_tokens = normalized_phrase.split()
+            if phrase_tokens and all(
+                any(
+                    token == candidate
+                    or candidate.startswith(token)
+                    or token.startswith(candidate)
+                    or SequenceMatcher(None, token, candidate).ratio() >= 0.82
+                    for candidate in text_tokens
+                )
+                for token in phrase_tokens
+            ):
+                return True
+            if self._phrase_similarity(joined, normalized_phrase) >= threshold:
+                return True
+        return False
 
     def _event_match_score(self, query: str, summary: str) -> float:
         normalized_query = self._normalize_event_text(query)
@@ -156,6 +265,17 @@ class TelegramBotService:
         value = re.sub(r"\b(сегодня|завтра|днем|днём|вечером|ночью|утром)\b", "", value, flags=re.IGNORECASE)
         value = re.sub(r"\s+", " ", value).strip(" ,.-")
         return value or None
+
+    @staticmethod
+    def _extract_last_assistant_anchor(memory: str) -> str | None:
+        if not memory:
+            return None
+        assistant_lines = [line for line in memory.splitlines() if line.startswith("assistant:")]
+        for line in reversed(assistant_lines):
+            matches = re.findall(r"[«\"]([^»\"]+)[»\"]", line)
+            if matches:
+                return matches[0].strip()
+        return None
 
     async def _resolve_relative_reference_from_calendar(
         self,
@@ -233,9 +353,9 @@ class TelegramBotService:
     @staticmethod
     def _is_yes(text: str) -> bool:
         cleaned = text.strip().lower()
-        if cleaned in {"да", "ага", "ок", "окей", "давай", "yes", "создавай"}:
+        if cleaned in {"да", "ага", "угу", "ок", "окей", "давай", "yes", "создавай", "ну да"}:
             return True
-        return cleaned.startswith("да")
+        return cleaned.startswith("да") or cleaned.startswith("ага") or cleaned.startswith("угу")
 
     @staticmethod
     def _is_no(text: str) -> bool:
@@ -246,7 +366,7 @@ class TelegramBotService:
 
     @staticmethod
     def _is_reaction(text: str) -> bool:
-        cleaned = text.strip().lower()
+        cleaned = text.strip().lower().replace("ё", "е")
         reactions = (
             "и все",
             "и всё",
@@ -295,6 +415,8 @@ class TelegramBotService:
             "в субботу",
             "в воскресенье",
             "через ",
+            "после ",
+            "до ",
         )
         verb_words = (
             "созвон",
@@ -305,17 +427,26 @@ class TelegramBotService:
             "универ",
             "написать",
             "сходить",
+            "позвонить",
+            "погулять",
+            "выставк",
+            "врач",
+            "маме",
             "создай",
             "добавь",
             "поставь",
             "запланируй",
         )
-        has_time_marker = bool(re.search(r"\b\d{1,2}:\d{2}\b", cleaned)) or any(word in cleaned for word in time_words)
+        has_time_marker = (
+            bool(re.search(r"\b\d{1,2}[:.]\d{2}\b", cleaned))
+            or bool(re.search(r"\b\d{1,2}\s*ч\b", cleaned))
+            or bool(re.search(r"\b\d{1,2}\s+ма[йя]\b", cleaned))
+            or any(word in cleaned for word in time_words)
+        )
         has_event_hint = any(word in cleaned for word in verb_words)
-        return has_time_marker and has_event_hint
+        return has_time_marker and (has_event_hint or len(cleaned.split()) <= 8)
 
-    @staticmethod
-    def _looks_like_recurring_request(text: str) -> bool:
+    def _looks_like_recurring_request(self, text: str) -> bool:
         cleaned = text.strip().lower()
         recurrence_markers = (
             "каждый ",
@@ -335,28 +466,70 @@ class TelegramBotService:
             "повторя",
             "регулярно",
         )
-        return any(marker in cleaned for marker in recurrence_markers)
+        return any(marker in cleaned for marker in recurrence_markers) or self._contains_phrase(
+            cleaned,
+            (
+                "каждый вторник",
+                "каждую среду",
+                "каждый четверг",
+                "каждую пятницу",
+                "каждый день",
+                "каждый будний день",
+                "ежедневно",
+                "еженедельно",
+            ),
+            threshold=0.8,
+        )
 
-    @staticmethod
-    def _fast_intent(text: str) -> str | None:
+    def _fast_intent(self, text: str) -> str | None:
         cleaned = text.strip().lower()
         if not cleaned:
             return None
-        if any(phrase in cleaned for phrase in ("что у меня сегодня", "что сегодня", "че сегодня", "чо сегодня", "че седня", "чек седня", "планы на сегодня")):
+        if self._contains_phrase(
+            cleaned,
+            (
+                "что у меня сегодня",
+                "что сегодня",
+                "че сегодня",
+                "чо сегодня",
+                "че седня",
+                "чек седня",
+                "планы на сегодня",
+                "что по планам сегодня",
+                "что у меня на сегодня",
+            ),
+        ):
             return "today_schedule"
-        if any(phrase in cleaned for phrase in ("что дальше", "что потом", "что сейчас", "что следующее", "что у меня дальше", "что у меня потом")):
+        if self._contains_phrase(
+            cleaned,
+            (
+                "что дальше",
+                "что потом",
+                "что сейчас",
+                "что следующее",
+                "что у меня дальше",
+                "что у меня потом",
+                "после этого",
+                "до этого",
+            ),
+        ) or cleaned.startswith("а после ") or cleaned.startswith("а до ") or cleaned.startswith("после ") or cleaned.startswith("до "):
             return "next_event"
-        if any(phrase in cleaned for phrase in ("найди окно", "свободное время", "подбери время", "когда есть время", "куда влезет", "раскидай", "найди слот")):
-            return "plan_events"
-        if any(phrase in cleaned for phrase in ("напомни", "напомин")):
-            return "set_reminder"
         if any(phrase in cleaned for phrase in ("перенеси", "сдвинь", "переименуй", "измени событие", "сделай на ")) and "последнее действие" not in cleaned:
             return "update_event"
         if any(phrase in cleaned for phrase in ("отмени", "удали", "убери", "сними")) and "последнее действие" not in cleaned:
             return "cancel_event"
-        if TelegramBotService._looks_like_create_event(cleaned):
+        if "напом" in cleaned:
+            return "set_reminder"
+        if (
+            any(phrase in cleaned for phrase in ("найди окно", "свободное время", "подбери время", "какое время есть", "куда влезет", "раскидай", "найди слот"))
+            or cleaned.startswith("когда есть время")
+            or ("какое время" in cleaned and "есть" in cleaned)
+            or cleaned.startswith("найди ")
+        ):
+            return "plan_events"
+        if self._looks_like_create_event(cleaned):
             return "create_event"
-        if any(phrase in cleaned for phrase in ("что умеешь", "хелп", "help", "команды", "что ты умеешь")):
+        if self._contains_phrase(cleaned, ("что умеешь", "хелп", "help", "команды", "что ты умеешь")):
             return "general_help"
         return None
 
@@ -1167,7 +1340,28 @@ class TelegramBotService:
         session: AsyncSession,
     ) -> None:
         now = datetime.now(self._tz())
-        anchor_query = self._extract_after_event_query(text or "") if text else None
+        raw_text = text or ""
+        memory = await self._memory_prompt(message.from_user.id, session)
+        implicit_anchor = self._extract_last_assistant_anchor(memory)
+        relation: str | None = None
+        anchor_query = None
+
+        explicit_after = self._extract_after_event_query(raw_text)
+        explicit_before = self._extract_before_event_query(raw_text)
+        lowered = raw_text.lower()
+        if explicit_after:
+            relation = "after"
+            anchor_query = explicit_after
+        elif explicit_before:
+            relation = "before"
+            anchor_query = explicit_before
+        elif "после этого" in lowered and implicit_anchor:
+            relation = "after"
+            anchor_query = implicit_anchor
+        elif "до этого" in lowered and implicit_anchor:
+            relation = "before"
+            anchor_query = implicit_anchor
+
         if anchor_query:
             search_start = now - timedelta(days=1)
             search_end = now + timedelta(days=14)
@@ -1192,15 +1386,38 @@ class TelegramBotService:
                 await message.answer(reply)
                 await self._remember(message.from_user.id, "assistant", reply, session)
                 return
-            next_events = await self.calendar_service.list_events(
-                access_token=access_token,
-                refresh_token=refresh_token,
-                time_min=anchor_end,
-                time_max=anchor_end + timedelta(days=7),
-                timezone=self.settings.default_timezone,
-                limit=2,
-            )
-            event = next_events[0] if next_events else None
+
+            if relation == "before":
+                anchor_start = self.calendar_service.parse_event_datetime(anchor_event, self.settings.default_timezone, "start")
+                if not anchor_start:
+                    reply = f"У события «{escape(anchor_event.get('summary') or anchor_query)}» не получилось прочитать время начала."
+                    await message.answer(reply)
+                    await self._remember(message.from_user.id, "assistant", reply, session)
+                    return
+                previous_events = await self.calendar_service.list_events(
+                    access_token=access_token,
+                    refresh_token=refresh_token,
+                    time_min=max(now - timedelta(days=7), anchor_start - timedelta(days=7)),
+                    time_max=anchor_start,
+                    timezone=self.settings.default_timezone,
+                    limit=20,
+                )
+                filtered_previous = []
+                for candidate in previous_events:
+                    candidate_start = self.calendar_service.parse_event_datetime(candidate, self.settings.default_timezone, "start")
+                    if candidate_start and candidate_start < anchor_start:
+                        filtered_previous.append(candidate)
+                event = filtered_previous[-1] if filtered_previous else None
+            else:
+                next_events = await self.calendar_service.list_events(
+                    access_token=access_token,
+                    refresh_token=refresh_token,
+                    time_min=anchor_end,
+                    time_max=anchor_end + timedelta(days=7),
+                    timezone=self.settings.default_timezone,
+                    limit=2,
+                )
+                event = next_events[0] if next_events else None
         else:
             event = await self.calendar_service.get_next_event(
                 access_token=access_token,
@@ -1213,7 +1430,7 @@ class TelegramBotService:
                 event = None
         if not event:
             reply = (
-                f"После этого события дальше пока ничего не вижу."
+                ("До этого события ничего более раннего не вижу." if relation == "before" else f"После этого события дальше пока ничего не вижу.")
                 if anchor_query
                 else "Пока ничего ближайшего не вижу. Похоже, день свободный."
             )
@@ -1244,15 +1461,15 @@ class TelegramBotService:
             reply = f"Сейчас у тебя идет «{summary}» до {end.strftime('%H:%M')}.{follow_up}"
             markup = None
         elif start:
-            prefix = "После этого у тебя" if anchor_query else "Дальше у тебя"
+            prefix = "До этого у тебя" if relation == "before" else ("После этого у тебя" if anchor_query else "Дальше у тебя")
             reply = f"{prefix} «{summary}» в {self._format_dt(start)}.{follow_up}"
             minutes_until = int((start - now).total_seconds() // 60)
             markup = self._next_event_keyboard(
-                can_remind_10=minutes_until > 10,
-                can_remind_60=minutes_until > 60,
+                can_remind_10=relation != "before" and minutes_until > 10,
+                can_remind_60=relation != "before" and minutes_until > 60,
             )
         else:
-            prefix = "После этого у тебя" if anchor_query else "Дальше у тебя"
+            prefix = "До этого у тебя" if relation == "before" else ("После этого у тебя" if anchor_query else "Дальше у тебя")
             reply = f"{prefix} событие «{summary}»."
             markup = None
         await message.answer(reply, reply_markup=markup)
@@ -1847,24 +2064,13 @@ class TelegramBotService:
         if not self._is_reaction(text):
             return False
 
-        memory = await self._memory_prompt(message.from_user.id, session)
-        if not memory:
-            return False
-
-        prompt = [
-            {
-                "role": "system",
-                "content": (
-                    "Ты дружелюбный русскоязычный календарный ассистент в Telegram. "
-                    "Пользователь только что отреагировал на предыдущий ответ короткой репликой. "
-                    "Ответь коротко, по-человечески, на ты, продолжая текущий контекст. "
-                    "Не начинай заново перечислять расписание, если тебя об этом не попросили. "
-                    "Не извиняйся без причины и не выдумывай факты."
-                ),
-            },
-            {"role": "user", "content": f"Recent conversation:\n{memory}\n\nLast user reaction:\n{text}"},
-        ]
-        reply = await self.deepinfra.chat_text(prompt, temperature=0.5)
+        cleaned = self._normalize_event_text(text)
+        if cleaned in {"и все", "и все?"}:
+            reply = "Да, по календарю на этом всё. Если хочешь, могу ещё подсказать свободные окна."
+        elif cleaned in {"офигет", "капец", "жест", "серьезн", "серьезно"}:
+            reply = "Понимаю. Если хочешь, сразу посмотрю, что у тебя дальше, или найду свободное время."
+        else:
+            reply = "Окей. Если хочешь, могу сразу что-то добавить, перенести или показать свободное время."
         await message.answer(reply)
         await self._remember(message.from_user.id, "assistant", reply, session)
         return True
@@ -2001,22 +2207,15 @@ class TelegramBotService:
         await self._friendly_fallback(message, text, session)
 
     async def _friendly_fallback(self, message: Message, text: str, session: AsyncSession) -> None:
-        prompt = [
-            {
-                "role": "system",
-                "content": (
-                    "Ты дружелюбный русскоязычный ассистент по календарю в Telegram. "
-                    "Отвечай коротко, тепло, на ты, без канцелярита. "
-                    "Не выдумывай факты и не говори, что у тебя нет доступа к календарю, если тебя об этом не спрашивали. "
-                    "Скажи, что ты можешь: создать событие, подсказать планы на сегодня, сказать что дальше по календарю. "
-                    "Предложи пользователю сформулировать запрос проще, с примерами. "
-                    "Если пользователь жалуется на распознавание, извинись и коротко скажи, что теперь слушаешь по-русски. "
-                    "Отвечай только по-русски."
-                ),
-            },
-            {"role": "user", "content": text},
-        ]
-        reply = await self.deepinfra.chat_text(prompt, temperature=0.4)
+        reply = (
+            "Не до конца понял запрос. Я лучше работаю, когда ты пишешь прямо по делу.\n"
+            "Например:\n"
+            "• созвон завтра в 15:00 на час\n"
+            "• что у меня сегодня\n"
+            "• что дальше\n"
+            "• перенеси созвон с Колей на 16:00\n"
+            "• отмени тренировку в пятницу"
+        )
         await message.answer(reply)
         await self._remember(message.from_user.id, "assistant", reply, session)
 
@@ -2041,7 +2240,9 @@ class TelegramBotService:
             await self._remember(message.from_user.id, "assistant", reply, session)
             return
         if not parsed.get("should_plan"):
-            await self._friendly_fallback(message, text, session)
+            reply = "Не до конца понял, какое окно тебе нужно. Напиши, например: «найди сегодня вечером 2 часа для прогулки»."
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
             return
 
         dates = parsed.get("dates") or []
@@ -2189,7 +2390,9 @@ class TelegramBotService:
             await self._remember(message.from_user.id, "assistant", reply, session)
             return
         if not parsed.get("should_set"):
-            await self._friendly_fallback(message, text, session)
+            reply = "Не до конца понял, к какому событию поставить напоминание. Напиши, например: «напомни за 10 минут до универа»."
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
             return
 
         timezone = parsed.get("timezone") or self.settings.default_timezone
@@ -3416,6 +3619,11 @@ class TelegramBotService:
             await self._remember(message.from_user.id, "assistant", reply, session)
             return
         if not parsed.get("should_create"):
+            if self._looks_like_create_event(text):
+                reply = "Не смог уверенно собрать событие. Напиши одной фразой что и когда, например: «созвон сегодня в 19:00 на час»."
+                await message.answer(reply)
+                await self._remember(message.from_user.id, "assistant", reply, session)
+                return
             await self._friendly_fallback(message, text, session)
             return
 
@@ -3550,7 +3758,9 @@ class TelegramBotService:
             await self._remember(message.from_user.id, "assistant", reply, session)
             return
         if not parsed.get("should_update"):
-            await self._friendly_fallback(message, text, session)
+            reply = "Не до конца понял, что именно менять. Напиши что-то вроде: «перенеси созвон с Колей на 16:00»."
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
             return
 
         timezone = parsed.get("timezone") or self.settings.default_timezone
@@ -3792,7 +4002,9 @@ class TelegramBotService:
             await self._remember(message.from_user.id, "assistant", reply, session)
             return
         if not parsed.get("should_cancel"):
-            await self._friendly_fallback(message, text, session)
+            reply = "Не до конца понял, что удалить. Напиши, например: «отмени тренировку в пятницу»."
+            await message.answer(reply)
+            await self._remember(message.from_user.id, "assistant", reply, session)
             return
 
         timezone = parsed.get("timezone") or self.settings.default_timezone
